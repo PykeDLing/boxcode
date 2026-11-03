@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!--
+  只放行带本次随机 nonce 的脚本，不许加载任何外部资源、不许联网。
+  'unsafe-eval' 是 pywebview 生成 js_api 时要用的 new Function；没有 nonce 的脚本照样跑不起来。
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'nonce-{{nonce}}' 'unsafe-eval'; style-src 'unsafe-inline'; img-src data:">
+<title>BoxCode</title>
+<style>/*{{style}}*/</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true"><span></span></div>
+      <div>
+        <div class="brand-name">BoxCode</div>
+        <div class="brand-sub">沙盒里的编程 Agent</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <button type="button" class="nav-item active" data-view="run" id="nav-run">
+        <span>新任务</span><span class="nav-flag" hidden></span>
+      </button>
+      <button type="button" class="nav-item" data-view="history" id="nav-history">
+        <span>历史轨迹</span><span class="nav-flag" hidden></span>
+      </button>
+      <button type="button" class="nav-item" data-view="eval" id="nav-eval">
+        <span>评测</span><span class="nav-flag" hidden></span>
+      </button>
+    </nav>
+    <dl class="sidebar-info" id="model-info"></dl>
+  </aside>
+
+  <main class="main">
+    <!-- 新任务 -->
+    <section class="view" id="view-run">
+      <header class="view-head">
+        <div>
+          <h1>新任务</h1>
+          <p>Agent 执行的每条命令都在 Seatbelt 沙盒里：只能写工作区，读不到凭证，默认断网。</p>
+        </div>
+      </header>
+      <div class="split">
+        <form class="pane form-pane" id="run-form" autocomplete="off">
+          <fieldset id="run-fields">
+            <div class="field">
+              <label class="label" for="f-workspace">工作区</label>
+              <div class="input-row">
+                <input id="f-workspace" class="input mono" spellcheck="false">
+                <button type="button" class="btn" id="f-pick">选择…</button>
+              </div>
+            </div>
+            <div class="field">
+              <label class="label" for="f-task">任务</label>
+              <textarea id="f-task" class="input" rows="6" placeholder="例如：tests/test_stats.py 没通过，修好它"></textarea>
+              <p class="hint">⌘↩ 开始</p>
+            </div>
+            <div class="field">
+              <span class="label" id="f-mode-label">权限模式</span>
+              <div class="segmented" id="f-mode" role="radiogroup" aria-labelledby="f-mode-label">
+                <button type="button" role="radio" data-mode="read-only">只读</button>
+                <button type="button" role="radio" data-mode="workspace-write">工作区可写</button>
+                <button type="button" role="radio" data-mode="full-auto">全自动</button>
+              </div>
+              <p class="hint" id="f-mode-hint"></p>
+            </div>
+            <div class="field">
+              <label class="label" for="f-verify">自检命令<span class="optional">可选</span></label>
+              <input id="f-verify" class="input mono" spellcheck="false" placeholder="python -m pytest -q">
+              <p class="hint">模型说做完后在沙盒里跑一遍；没通过就把输出交回去继续修。</p>
+            </div>
+            <label class="check">
+              <input type="checkbox" id="f-network">
+              <span>沙盒里允许联网</span>
+            </label>
+            <p class="hint warn" id="f-network-warn" hidden>联网后，被注入的命令可以把工作区里的内容发出去。</p>
+          </fieldset>
+          <div class="actions">
+            <button type="submit" class="btn primary" id="f-start">开始</button>
+            <button type="button" class="btn danger" id="f-stop" hidden>停止</button>
+          </div>
+          <p class="error" id="f-error" role="alert" hidden></p>
+        </form>
+        <div class="pane detail-pane" id="run-pane">
+          <div class="empty" id="run-empty">
+            <div class="empty-title">还没有开始</div>
+            <p>写好任务点“开始”，这里会实时显示每次模型调用、工具调用、权限决定和自检结果。</p>
+            <p>需要你确认的命令会出现在最上面。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 历史轨迹 -->
+    <section class="view" id="view-history" hidden>
+      <header class="view-head">
+        <div>
+          <h1>历史轨迹</h1>
+          <p id="history-sub">每次运行的执行轨迹，每一步一行 JSON。</p>
+        </div>
+        <button type="button" class="btn" id="h-refresh">刷新</button>
+      </header>
+      <div class="split">
+        <div class="pane list-pane">
+          <input class="input" id="h-filter" placeholder="按任务或工作区筛选" spellcheck="false">
+          <ul class="run-list" id="h-list"></ul>
+        </div>
+        <div class="pane detail-pane" id="h-pane"></div>
+      </div>
+    </section>
+
+    <!-- 评测 -->
+    <section class="view" id="view-eval" hidden>
+      <header class="view-head">
+        <div>
+          <h1>评测</h1>
+          <p>每道题的仓库复制到临时目录让 Agent 去做，判分也在沙盒里跑；要确认的命令一律拒绝。</p>
+        </div>
+        <button type="button" class="btn" id="e-refresh">刷新</button>
+      </header>
+      <div class="split">
+        <div class="pane list-pane">
+          <div class="block">
+            <div class="block-head">
+              <h2>题目</h2>
+              <button type="button" class="link" id="e-toggle-all">全不选</button>
+            </div>
+            <ul class="task-list" id="e-tasks"></ul>
+            <div class="actions">
+              <button type="button" class="btn primary" id="e-start">运行所选</button>
+              <button type="button" class="btn danger" id="e-stop" hidden>停止</button>
+            </div>
+            <p class="error" id="e-error" role="alert" hidden></p>
+          </div>
+          <div class="block">
+            <div class="block-head"><h2>历史报告</h2></div>
+            <ul class="report-list" id="e-reports"></ul>
+          </div>
+        </div>
+        <div class="pane detail-pane" id="e-pane"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast" role="status" hidden></div>
+<script nonce="{{nonce}}">/*{{script}}*/</script>
+</body>
+</html>

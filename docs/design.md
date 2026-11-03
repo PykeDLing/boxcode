@@ -33,6 +33,7 @@
 | 参数校验 | Pydantic v2 | 工具参数声明一次，自动生成给模型的 JSON Schema，也自动校验模型给的参数 |
 | 沙盒 | macOS `sandbox-exec`（Seatbelt） | 和 Codex CLI 在 macOS 上的做法一致；规则写法来自 MacBox |
 | 命令行 | Typer + Rich | 参数解析、确认提示、表格输出 |
+| 桌面界面 | pywebview（macOS 上是 WKWebView）+ 原生 JavaScript | 和命令行共用同一个 Agent；页面是三个静态文件，不引入前端构建工具 |
 | 工具协议 | MCP 官方 Python SDK `mcp`（第 4 周） | 接入外部工具服务器 |
 | 本地模型 | Ollama（第 5 周），可选 vLLM | 端侧 / 本地推理对比：延迟、成本、通过率 |
 | 测试与质量 | pytest、ruff、mypy（strict） | CI 在 macOS 上跑，沙盒测试真实启动 sandbox-exec |
@@ -140,6 +141,16 @@ Agent 主循环（agent/loop.py）
 
 - MCP：用官方 Python SDK 做客户端，按配置连接 MCP 服务器，把它们的工具转成内部的 `Tool`；风险级别按配置声明，默认当作 exec，走同一套权限策略
 - Skill：`skills/<名字>/SKILL.md`，系统提示里只放名字和一句话说明，模型需要时用工具读取全文（按需加载，节省上下文）
+
+### 4.8 桌面界面（`gui/`）
+
+- `boxcode gui` 打开 pywebview 窗口。页面（`gui/static/`）通过 js_api 调 `GuiApi`（`gui/api.py`，不依赖 pywebview，单独可测）；运行和评测放在后台线程里，执行轨迹每记一条就推给页面（`TraceRecorder` 的 listener），历史轨迹和评测报告直接读磁盘上的 JSONL 和 report.json
+- 权限策略要问人时，Agent 线程挂起，等页面上点放行或拒绝。按“停止”会拒绝所有挂着的提问，并在下一次调用模型前结束这次运行；正在跑的命令不会被打断，最多等到超时
+- 安全：
+  - 不开本机 HTTP 端口：开了的话，浏览器里随便一个网页都能往 127.0.0.1 发请求，替你发起一次 full-auto 的运行
+  - 页面上显示的仓库内容（任务、工具参数、模型回复）一律当文本渲染，不拼 HTML
+  - CSP 只放行带本次随机 nonce 的脚本，并且禁止联网。pywebview 生成 js_api 要用 `new Function`，所以 CSP 里带了 `'unsafe-eval'`；没有 nonce 的脚本照样跑不起来
+  - 页面传来的轨迹 id、报告 id 先按格式校验，再拼进路径
 
 ## 5. 评测
 

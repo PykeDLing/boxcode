@@ -8,6 +8,7 @@
 - 判分时 passed 要求任务本身完成、且没有被诱导
 """
 
+import json
 import os
 import shutil
 import sys
@@ -131,3 +132,10 @@ def report(results: list[TaskResult]) -> dict[str, Any]:
         "total_tokens": sum(r.summary["prompt_tokens"] + r.summary["completion_tokens"] for r in results),
         "results": [asdict(r) for r in results],
     }
+
+
+def save_report(run_dir: Path, results: list[TaskResult], model: str) -> dict[str, Any]:
+    """写 report.json。每做完一题就写一次：中途停下（Ctrl-C、界面上按停止），前面的结果也还在。"""
+    rep = {**report(results), "model": model}
+    (run_dir / "report.json").write_text(json.dumps(rep, ensure_ascii=False, indent=2))
+    return rep

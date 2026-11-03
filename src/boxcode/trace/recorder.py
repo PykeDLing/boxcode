@@ -6,15 +6,20 @@
 import json
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+Listener = Callable[[dict[str, Any]], None]
+
 
 class TraceRecorder:
-    def __init__(self, runs_dir: Path | None) -> None:
+    def __init__(self, runs_dir: Path | None, listener: Listener | None = None) -> None:
         self.run_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
         self.events: list[dict[str, Any]] = []
         self.path: Path | None = None
+        # 每记一条事件就调用一次：桌面界面用它实时显示执行过程
+        self.listener = listener
         if runs_dir is not None:
             runs_dir.mkdir(parents=True, exist_ok=True)
             self.path = runs_dir / f"{self.run_id}.jsonl"
@@ -25,6 +30,8 @@ class TraceRecorder:
         if self.path is not None:
             with self.path.open("a") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if self.listener is not None:
+            self.listener(record)
 
     def of(self, event: str) -> list[dict[str, Any]]:
         return [e for e in self.events if e["event"] == event]
@@ -42,3 +49,16 @@ class TraceRecorder:
             "tool_errors": sum(1 for e in tools if not e["ok"]),
             "denied": sum(1 for e in tools if e["decision"] == "deny"),
         }
+
+
+def read_trace(path: Path) -> list[dict[str, Any]]:
+    """读回一次运行的全部事件。写了一半的行（进程中途被杀）跳过。"""
+    events = []
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            events.append(record)
+    return events

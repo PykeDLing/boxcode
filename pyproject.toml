@@ -16,11 +16,17 @@ dependencies = [
 [project.scripts]
 boxcode = "boxcode.cli:app"
 
+[project.optional-dependencies]
+gui = [
+    "pywebview>=6.2.1",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
     "ruff>=0.8",
     "mypy>=1.13",
+    "pywebview>=6.2.1",
 ]
 
 [build-system]
