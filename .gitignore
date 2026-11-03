@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境（uv sync 生成）
+.venv/
+
+# 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 密钥和本机配置：API key 放环境变量或 .env，不进仓库
+.env
+.env.*
+!.env.example
+
+# 评测结果：执行轨迹里有完整的对话和工具输出
+evals/results/
+
+# 编辑器和系统
+.DS_Store
+.idea/
+.vscode/
+*.swp

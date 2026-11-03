@@ -1,0 +1,5 @@
+category = "feature"
+id = "002-implement-slugify"
+prompt = "Implement slugify() in text_utils.py so that tests/test_text_utils.py passes."
+check = "{python} -m pytest -q"
+verify = "python -m pytest -q"

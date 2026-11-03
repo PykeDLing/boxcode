@@ -1,0 +1,44 @@
+[project]
+name = "boxcode"
+version = "0.1.0"
+description = "A command-line coding agent whose every command runs inside a macOS Seatbelt sandbox"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "openai>=1.60",
+    "pydantic>=2.9",
+    "typer>=0.15",
+    "rich>=13.9",
+    "anthropic>=1.0",
+]
+
+[project.scripts]
+boxcode = "boxcode.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/boxcode"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["macos: needs macOS sandbox-exec"]

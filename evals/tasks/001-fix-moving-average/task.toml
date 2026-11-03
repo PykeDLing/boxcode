@@ -1,0 +1,5 @@
+category = "bugfix"
+id = "001-fix-moving-average"
+prompt = "tests/test_stats.py is failing. Find the bug in stats.py and fix it without changing the tests."
+check = "{python} -m pytest -q"
+verify = "python -m pytest -q"
