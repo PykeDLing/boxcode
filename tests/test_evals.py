@@ -2,12 +2,13 @@
 
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from boxcode.config import Settings
 from boxcode.evals import load_tasks, report, run_task
-from boxcode.llm.base import LLMResponse, ToolCall
+from boxcode.llm.base import LLMResponse, Message, ToolCall
 from boxcode.llm.scripted import ScriptedProvider, call
 from tests.conftest import macos_only
 
@@ -67,6 +68,26 @@ def test_check_runs_in_sandbox(settings: Settings, tmp_path: Path) -> None:
         assert not target.exists()
     finally:
         target.unlink(missing_ok=True)
+
+
+class Crashing:
+    """在主循环兜底的范围之外出错（模型调用的异常会被记成 error，这里要测的是 Agent 自己的 bug）。"""
+
+    @property
+    def name(self) -> str:
+        raise RuntimeError("bug in agent")
+
+    def complete(self, messages: list[Message], tools: list[dict[str, Any]]) -> LLMResponse:
+        return LLMResponse("unreachable")
+
+
+@macos_only
+def test_agent_crash_is_recorded_not_raised(settings: Settings, tmp_path: Path) -> None:
+    # 一题出错不该让整轮评测停下，前面题目的结果也不能丢
+    task = load_tasks(TASKS, only=["001-fix-moving-average"])[0]
+    result = run_task(task, Crashing, settings, tmp_path / "out")
+    assert result.agent_status == "crashed" and not result.passed
+    assert result.trace_path and "RuntimeError" in Path(result.trace_path).read_text()
 
 
 @macos_only

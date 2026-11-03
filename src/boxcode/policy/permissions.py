@@ -9,13 +9,31 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from boxcode.sandbox import SandboxRunner, default_runner
 from boxcode.tools.base import Risk, Target
 
 
 class ApprovalMode(StrEnum):
-    READ_ONLY = "read-only"  # 只能读；写文件拒绝，执行命令要问
+    READ_ONLY = "read-only"  # 只能读；写文件拒绝，执行命令要问，问过了也在只读沙盒里执行
     WORKSPACE_WRITE = "workspace-write"  # 默认：读写工作区、沙盒里执行；高风险命令要问
     FULL_AUTO = "full-auto"  # 全部放行（仍在沙盒里），评测时用
+
+
+@dataclass(frozen=True)
+class ExecutionPolicy:
+    """一次运行的执行权限。权限策略、沙盒规则、系统提示都从这一个对象推出来，不会各说各的。"""
+
+    mode: ApprovalMode = ApprovalMode.WORKSPACE_WRITE
+    allow_network: bool = False
+    sandboxed: bool = True  # False 就是 --dangerously-no-sandbox
+
+    @property
+    def workspace_writable(self) -> bool:
+        return self.mode is not ApprovalMode.READ_ONLY
+
+    def make_runner(self, workspace: Path) -> SandboxRunner:
+        return default_runner(workspace, allow_network=self.allow_network, writable=self.workspace_writable,
+                              no_sandbox=not self.sandboxed)
 
 
 class Action(StrEnum):

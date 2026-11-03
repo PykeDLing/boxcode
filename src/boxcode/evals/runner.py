@@ -23,8 +23,7 @@ from typing import Any
 from boxcode.agent import Agent, deny_all
 from boxcode.config import Settings
 from boxcode.llm.base import LLMProvider
-from boxcode.policy import ApprovalMode
-from boxcode.sandbox import default_runner
+from boxcode.policy import ApprovalMode, ExecutionPolicy
 
 # 判分时用原题版本的文件（相对 repo/ 的路径，fnmatch 写法，* 可以跨目录）
 CHECK_PROTECTED = ("tests/*", "conftest.py", "*/conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini")
@@ -95,26 +94,29 @@ def run_task(task: Task, make_llm: Callable[[], LLMProvider], settings: Settings
     with tempfile.TemporaryDirectory(prefix=f"boxcode-{task.id}-") as tmp:
         ws = Path(tmp) / "repo"
         shutil.copytree(task.repo, ws)
-        agent = Agent(
-            make_llm(), ws, default_runner(ws, allow_network=False, no_sandbox=no_sandbox),
-            replace(settings, home=out_dir), mode=ApprovalMode.WORKSPACE_WRITE, approver=deny_all,
-        )
+        execution = ExecutionPolicy(ApprovalMode.WORKSPACE_WRITE, allow_network=False, sandboxed=not no_sandbox)
+        agent = Agent(make_llm(), ws, replace(settings, home=out_dir), execution, approver=deny_all)
         t0 = time.monotonic()
-        result = agent.run(task.prompt, verify_command=task.verify)
+        try:
+            status = agent.run(task.prompt, verify_command=task.verify).status.value
+        except Exception as e:
+            # Agent 自己的 bug 不该让整轮评测停下：记进轨迹，照常判分，接着跑下一题
+            status = "crashed"
+            agent.trace.emit("run_end", status=status, error=f"{type(e).__name__}: {e}", **agent.trace.summary())
         seconds = round(time.monotonic() - t0, 2)
+        trace = agent.trace
 
         check_dir = Path(tmp) / "check"
         prepare_check_dir(task, ws, check_dir)
-        checker = default_runner(check_dir, allow_network=False, no_sandbox=no_sandbox)
-        check = checker.run(task.check.format(python=sys.executable), check_dir, 300)
+        check = execution.make_runner(check_dir).run(task.check.format(python=sys.executable), check_dir, 300)
         check_passed = check.exit_code == 0 and not check.timed_out
-        attempted = " ".join(e["arguments"] for e in result.trace.of("tool_call"))
+        attempted = " ".join(e["arguments"] for e in trace.of("tool_call"))
         induced = any(s in attempted for s in task.forbidden)
         return TaskResult(
             id=task.id, category=task.category, passed=check_passed and not induced,
-            agent_status=result.status.value, check_passed=check_passed, induced=induced,
-            seconds=seconds, summary=result.trace.summary(),
-            trace_path=str(result.trace.path) if result.trace.path else None,
+            agent_status=status, check_passed=check_passed, induced=induced,
+            seconds=seconds, summary=trace.summary(),
+            trace_path=str(trace.path) if trace.path else None,
         )
 
 

@@ -78,7 +78,7 @@ def test_truncated_tool_calls_not_executed(workspace: Path, settings: Settings) 
         LLMResponse(None, [call("write_file", path="big.txt", content="half")], truncated=True),
         LLMResponse("ok"),
     ])
-    Agent(llm, workspace, NoSandboxRunner(), settings).run("write")
+    Agent(llm, workspace, settings, runner=NoSandboxRunner()).run("write")
     assert not (workspace / "big.txt").exists()
     tool_msg = llm.seen[1][-1]
     assert tool_msg["role"] == "tool" and tool_msg["_is_error"] is True and "max_tokens" in tool_msg["content"]
@@ -86,6 +86,6 @@ def test_truncated_tool_calls_not_executed(workspace: Path, settings: Settings) 
 
 def test_refusal_stops_without_running_tools(workspace: Path, settings: Settings) -> None:
     llm = ScriptedProvider([LLMResponse(None, [call("write_file", path="x", content="y")], stop_reason="refusal")])
-    result = Agent(llm, workspace, NoSandboxRunner(), settings).run("x")
+    result = Agent(llm, workspace, settings, runner=NoSandboxRunner()).run("x")
     assert result.status is Status.REFUSED
     assert not (workspace / "x").exists()
