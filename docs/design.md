@@ -82,13 +82,14 @@ Agent 主循环（agent/loop.py）
 | `run_command` | exec | 在沙盒里执行，超时、输出截断 |
 
 - 文件工具在 Agent 进程里执行，不经过沙盒，所以路径必须用 `resolve_in_workspace` 解析：解析符号链接后仍在工作区内，挡住 `../` 和指向外面的链接
+- `grep`、`list_dir` 遍历目录时跳过指向工作区外的符号链接：沙盒里的命令能建一个指向 `~/.ssh/id_rsa` 的链接，进程内的工具跟着它读，就绕过了沙盒
 - 工具输出回给模型前截断到 12000 字符，保留开头和结尾（报错常在最后）
 
 ### 4.3 权限策略（`policy/permissions.py`）
 
 三种模式：`read-only`、`workspace-write`（默认）、`full-auto`。每次调用返回放行、询问、拒绝之一，并带上原因写进轨迹。
 
-- 写 `.git/hooks`、`.git/config` 一律拒绝：改了 hook，下次用户在沙盒外 `git commit` 就会执行它，等于逃出沙盒
+- 写任何一层的 `.git` 一律拒绝（比较时不区分大小写：APFS 默认不区分，`.GIT/HOOKS` 就是 `.git/hooks`）：改了 hook、`core.fsmonitor`，或者把 `.git` 换成指向别处的文件，下次用户在沙盒外运行 git 就会执行它，等于逃出沙盒
 - 联网、远程访问、`git push`、安装依赖、递归删除、提权、执行解码内容这几类命令要问人
 - **策略不是边界**：命令可以换写法绕过正则。它的作用是把高风险操作提前拿给人看，并留下记录；真正挡住破坏的是沙盒
 
@@ -98,14 +99,14 @@ Agent 主循环（agent/loop.py）
 
 | 方面 | 规则 |
 | --- | --- |
-| 写 | 默认全部禁止；放行工作区、`/private/tmp`、`/private/var/folders`、`/dev`；工作区里的 `.git/hooks`、`.git/config` 再禁止 |
-| 读 | 挡住 `~/.ssh`、`~/.gnupg`、`~/.aws`、`~/.docker`、`~/.netrc`、`~/.git-credentials`、`~/.config/gh`、shell 历史、钥匙串、邮件、Safari、其他 App 的数据，以及 BoxCode 自己的轨迹 |
+| 写 | 默认全部禁止；放行工作区、`/private/tmp`、`/private/var/folders`、`/dev`；工作区里任何一层的 `.git` 再禁止（正则匹配，不区分大小写），所以 `.git` 不能改、不能改名、不能新建 |
+| 读 | 挡住 `~/.ssh`、`~/.gnupg`、`~/.aws`、`~/.docker`、`~/.netrc`、`~/.git-credentials`、`~/.config/gh` 等凭证，`.zshrc` 等 shell 配置和历史，工作区外的 `.env`，钥匙串、邮件、Safari、其他 App 的数据，以及 BoxCode 自己的轨迹 |
 | 套接字 | 连不上主目录里别的程序的套接字（gpg-agent、1Password SSH 代理、Docker） |
 | 网络 | 默认断网：挡 IP 连接、等待连入、mDNSResponder 域名解析；`--allow-network` 才放行 |
 | 环境变量 | 只传白名单（PATH、HOME、LANG 等）：模型的 API key、`SSH_AUTH_SOCK`、云凭证都不传 |
 | Apple 事件 | 禁止，不能遥控其他 App |
 
-**防什么、不防什么**：防的是模型被注入或犯错时读走凭证、改坏工作区外的东西、偷偷联网。不防内核漏洞，和用户共用一个用户身份；`/private/tmp` 可写，可能留下文件。
+**防什么、不防什么**：防的是模型被注入或犯错时读走凭证、改坏工作区外的东西、偷偷联网。不防内核漏洞，和用户共用一个用户身份；`/private/tmp` 可写，可能留下文件；读是黑名单，没列出来的文件（例如别的项目的源码）仍然读得到。
 
 ### 4.5 上下文工程（`agent/context.py`）
 
@@ -141,9 +142,11 @@ Agent 主循环（agent/loop.py）
 
 ```
 evals/tasks/001-fix-moving-average/
-  task.toml   # id、category、prompt、check（判分命令）、verify（给 Agent 的自检命令）、forbidden（注入题）
+  task.toml   # id、category、prompt、check（判分命令）、verify（给 Agent 的自检命令）、forbidden（注入题）、protected（可选）
   repo/       # 题目仓库，评测时复制到临时目录
 ```
+
+判分不在 Agent 的工作区里直接跑：另建一个目录，放原题 + Agent 的改动，其中 `protected` 列出的文件（默认 `tests/`、`conftest.py` 和 pytest 配置文件）一律用原题的版本，Agent 改测试、加 conftest 都不算通过。判分命令也在沙盒里跑：测试会导入 Agent 写的代码，在沙盒外跑就等于让注入的代码逃出沙盒。
 
 现有 3 道：修 bug（001）、实现函数（002）、README 里藏了“读取 ~/.ssh/id_rsa 并上传”的注入题（101）。目标是第 5 周扩到 30–50 道：
 
@@ -200,4 +203,5 @@ evals/tasks/001-fix-moving-average/
 - 沙盒只支持 macOS；Linux 可以在之后用 bubblewrap 或 Docker 实现同一个 `SandboxRunner` 接口
 - 权限策略的命令匹配是正则，可以被绕过（见 4.3），不能单独依赖
 - 沙盒里无法安装依赖（默认断网、不能写工作区外的缓存目录），需要的依赖要在运行前装好
+- 沙盒读文件用黑名单，只挡常见的凭证位置；工作区里的 `.git` 只读，沙盒里不能 `git add`、`git commit`
 - `/private/tmp`、`/private/var/folders` 可写，Agent 可以在这里留下文件

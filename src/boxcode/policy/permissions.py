@@ -30,8 +30,9 @@ class Decision:
     reason: str
 
 
-# 工作区里也不许改的位置：改了 git hook，下次你在沙盒外 git commit 就会执行它
-PROTECTED = (".git/hooks", ".git/config")
+# 工作区里也不许改的位置：任何一层的 .git。改了 hook、core.fsmonitor，或者把 .git 换成指向别处的文件，
+# 下次你在沙盒外运行 git 就会执行攻击者的命令。APFS 默认不区分大小写，.GIT/HOOKS 也是同一个目录
+PROTECTED_DIR = ".git"
 
 # 要先问人的命令
 RISKY_COMMANDS: tuple[tuple[str, str], ...] = (
@@ -57,9 +58,9 @@ class Policy:
             if self.mode is ApprovalMode.READ_ONLY:
                 return Decision(Action.DENY, "只读模式不能写文件")
             for p in target.paths:
-                rel = p.relative_to(self.workspace).as_posix()
-                if any(rel == q or rel.startswith(q + "/") for q in PROTECTED):
-                    return Decision(Action.DENY, f"受保护的位置：{rel}")
+                rel = p.relative_to(self.workspace)
+                if any(part.casefold() == PROTECTED_DIR for part in rel.parts):
+                    return Decision(Action.DENY, f"受保护的位置：{rel.as_posix()}")
             return Decision(Action.ALLOW, "写工作区内的文件")
 
         # Risk.EXEC

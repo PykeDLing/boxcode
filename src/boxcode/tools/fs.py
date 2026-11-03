@@ -1,10 +1,37 @@
 """文件工具。在 Agent 进程里执行（不经过沙盒），所以路径一律限制在工作区内。"""
 
+import os
+from collections.abc import Iterator
+from pathlib import Path
+
 from pydantic import BaseModel, Field
 
-from boxcode.tools.base import Risk, Tool, ToolContext, ToolError, ToolResult, resolve_in_workspace, truncate
+from boxcode.tools.base import (
+    Risk,
+    Tool,
+    ToolContext,
+    ToolError,
+    ToolResult,
+    in_workspace,
+    resolve_in_workspace,
+    truncate,
+)
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache"}
+
+
+def walk_workspace(workspace: Path, root: Path) -> Iterator[Path]:
+    """遍历 root 下的文件和目录：不进入 SKIP_DIRS，跳过指向工作区外的符号链接。
+
+    沙盒里的命令可以建一个指向 ~/.ssh/id_rsa 的链接，文件工具不在沙盒里，跟着链接就读出来了。
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in (*dirnames, *filenames):
+            p = Path(dirpath) / name
+            if p.is_symlink() and not in_workspace(workspace, p):
+                continue
+            yield p
 
 
 class ReadFile(Tool):
@@ -43,9 +70,7 @@ class ListDir(Tool):
         if not root.is_dir():
             raise ToolError(f"不是目录：{params.path}")
         out: list[str] = []
-        for p in sorted(root.rglob("*")):
-            if any(part in SKIP_DIRS for part in p.relative_to(root).parts):
-                continue
+        for p in sorted(walk_workspace(ctx.workspace, root)):
             out.append(str(p.relative_to(ctx.workspace)) + ("/" if p.is_dir() else ""))
             if len(out) >= params.max_entries:
                 out.append(f"... 超过 {params.max_entries} 项，已截断")

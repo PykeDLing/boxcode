@@ -19,9 +19,19 @@ def test_write_in_workspace_allowed(policy: Policy, workspace: Path) -> None:
     assert policy.check(Risk.WRITE, Target(paths=[workspace / "a.py"])).action is Action.ALLOW
 
 
-def test_git_hooks_protected(policy: Policy, workspace: Path) -> None:
-    d = policy.check(Risk.WRITE, Target(paths=[workspace / ".git/hooks/pre-commit"]))
-    assert d.action is Action.DENY
+@pytest.mark.parametrize("rel", [
+    ".git/hooks/pre-commit", ".git/config", ".git",
+    ".GIT/HOOKS/pre-commit",  # APFS 默认不区分大小写，这就是 .git/hooks
+    ".git/modules/sub/hooks/post-checkout",  # 子模块的 hook
+    "sub/.git", "vendor/lib/.Git/config",  # 嵌套的仓库
+])
+def test_git_dir_protected(policy: Policy, workspace: Path, rel: str) -> None:
+    assert policy.check(Risk.WRITE, Target(paths=[workspace / rel])).action is Action.DENY
+
+
+@pytest.mark.parametrize("rel", [".gitignore", ".github/workflows/ci.yml", "src/git/x.py"])
+def test_git_lookalikes_allowed(policy: Policy, workspace: Path, rel: str) -> None:
+    assert policy.check(Risk.WRITE, Target(paths=[workspace / rel])).action is Action.ALLOW
 
 
 @pytest.mark.parametrize("cmd", [

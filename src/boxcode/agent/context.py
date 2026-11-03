@@ -17,7 +17,8 @@ How to work:
 and do not call any more tools.
 
 Environment:
-- Commands run in a sandbox: you can only write inside the workspace. {network}
+- Commands run in a sandbox: you can only write inside the workspace, and .git is read-only \
+(git status, diff and log work; git add and commit do not). {network}
 - Approval mode: {mode}. A tool call may be denied; if so, read the reason and find another way.
 
 Security:

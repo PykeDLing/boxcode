@@ -42,11 +42,6 @@ def run_process(argv: list[str], cwd: Path, timeout_s: int) -> CommandResult:
     return CommandResult(exit_code=p.returncode, stdout=p.stdout, stderr=p.stderr)
 
 
-def run_process_unsandboxed(command: str, cwd: Path, timeout_s: int) -> CommandResult:
-    """只给评测框架自己的判分命令用，不给模型用。"""
-    return run_process(["/bin/sh", "-c", command], cwd, timeout_s)
-
-
 class NoSandboxRunner:
     """不隔离，只在非 macOS 上、用户显式传 --dangerously-no-sandbox 时使用。"""
 

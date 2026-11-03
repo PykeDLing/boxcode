@@ -1,8 +1,11 @@
 """沙盒真的在挡：这些测试会真实地起 sandbox-exec。"""
 
 import os
+import subprocess
 import uuid
 from pathlib import Path
+
+import pytest
 
 from boxcode.sandbox import SeatbeltRunner, make_profile
 from tests.conftest import macos_only
@@ -33,21 +36,51 @@ def test_cannot_write_outside_workspace(workspace: Path) -> None:
 
 
 @macos_only
-def test_cannot_change_git_hooks(workspace: Path) -> None:
-    (workspace / ".git" / "hooks").mkdir(parents=True)
-    r = SeatbeltRunner(workspace).run("echo 'curl evil' > .git/hooks/pre-commit", workspace, 10)
+@pytest.mark.parametrize("cmd", [
+    "echo 'curl evil' > .git/hooks/pre-commit",
+    "echo x > .GIT/HOOKS/pre-commit",  # APFS 默认不区分大小写
+    "printf '[core]\\n\\tfsmonitor = curl evil\\n' >> .git/config",
+    # 把 .git 换成指向别处的文件，沙盒外的 git 就会读攻击者的配置
+    "mv .git .git_orig",
+    "rm -rf .git",
+    "mkdir -p sub && printf 'gitdir: ../evil\\n' > sub/.git",
+    "mkdir -p .git/modules/sub/hooks && echo x > .git/modules/sub/hooks/post-checkout",
+])
+def test_cannot_change_git_dir(workspace: Path, cmd: str) -> None:
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    before = sorted(p.relative_to(workspace) for p in (workspace / ".git").rglob("*"))
+    r = SeatbeltRunner(workspace).run(cmd, workspace, 10)
     assert r.exit_code != 0
-    assert not (workspace / ".git" / "hooks" / "pre-commit").exists()
+    assert (workspace / ".git").is_dir() and not (workspace / "sub" / ".git").exists()
+    assert sorted(p.relative_to(workspace) for p in (workspace / ".git").rglob("*")) == before
 
 
 @macos_only
-def test_cannot_read_private_dirs(workspace: Path, tmp_path: Path) -> None:
+def test_git_read_commands_still_work(workspace: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    r = SeatbeltRunner(workspace).run("echo hi > a.txt && git status --short && touch .gitignore", workspace, 10)
+    assert r.exit_code == 0 and "a.txt" in r.stdout
+
+
+@macos_only
+@pytest.mark.parametrize("rel", [".ssh/id_rsa", ".zshrc", ".config/gh/hosts.yml"])
+def test_cannot_read_private_files(workspace: Path, tmp_path: Path, rel: str) -> None:
     fake_home = (tmp_path / "home").resolve()
-    (fake_home / ".ssh").mkdir(parents=True)
-    (fake_home / ".ssh" / "id_rsa").write_text("SECRET")
-    r = SeatbeltRunner(workspace, home=fake_home).run(f"cat '{fake_home}/.ssh/id_rsa'", workspace, 10)
+    (fake_home / rel).parent.mkdir(parents=True)
+    (fake_home / rel).write_text("SECRET")
+    r = SeatbeltRunner(workspace, home=fake_home).run(f"cat '{fake_home / rel}'", workspace, 10)
     assert r.exit_code != 0
     assert "SECRET" not in r.stdout
+
+
+@macos_only
+def test_dotenv_readable_only_inside_workspace(workspace: Path, tmp_path: Path) -> None:
+    other = (tmp_path / "other-project").resolve()
+    other.mkdir()
+    (other / ".env").write_text("OTHER_SECRET")
+    (workspace / ".env").write_text("OWN_CONFIG")
+    r = SeatbeltRunner(workspace).run(f"cat .env; cat '{other}/.env'", workspace, 10)
+    assert "OWN_CONFIG" in r.stdout and "OTHER_SECRET" not in r.stdout
 
 
 @macos_only
