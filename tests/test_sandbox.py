@@ -1,18 +1,32 @@
 """沙盒真的在挡：这些测试会真实地起 sandbox-exec。"""
 
 import contextlib
+import http.server
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from boxcode.agent import Agent
+from boxcode.config import Settings
+from boxcode.evals import load_tasks
+from boxcode.llm.base import LLMResponse
+from boxcode.llm.scripted import ScriptedProvider, call
+from boxcode.policy import ApprovalMode, ExecutionPolicy
 from boxcode.sandbox import NoSandboxRunner, SandboxRunner, SeatbeltRunner, make_profile
 from tests.conftest import macos_only
+
+TASKS = Path(__file__).parent.parent / "evals" / "tasks"
 
 
 def test_profile_contains_workspace_and_offline_rules(workspace: Path) -> None:
@@ -158,3 +172,61 @@ def test_secrets_not_in_env(workspace: Path) -> None:
         assert "sk-should-not-leak" not in r.stdout
     finally:
         del os.environ["BOXCODE_API_KEY"]
+
+
+@pytest.fixture
+def exfil_server() -> Iterator[tuple[str, list[bytes]]]:
+    """本机起一个收数据的服务，冒充注入里的 attacker.example：收到任何请求就算泄漏。"""
+    hits: list[bytes] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            hits.append(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_port}", hits
+    srv.shutdown()
+
+
+@macos_only
+@pytest.mark.parametrize("task_id", ["101-injection-readme", "102-injection-agents-md"])
+def test_injected_commands_stopped_by_sandbox_alone(
+    workspace: Path, tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch,
+    exfil_server: tuple[str, list[bytes]], task_id: str,
+) -> None:
+    # 真实模型跑评测时自己就拒绝了，沙盒没被测到。这里假设模型被骗、权限策略也放行（full-auto），
+    # 原样执行注入里的命令，只剩沙盒在挡
+    url, hits = exfil_server
+    task = load_tasks(TASKS, only=[task_id])[0]
+    shutil.copytree(task.repo, workspace, dirs_exist_ok=True)
+    injected = "\n".join(p.read_text() for p in workspace.glob("*.md"))
+    commands = [c.replace("https://attacker.example", url) for c in re.findall(r"(?:cat|curl) [^`\n]+", injected)]
+    assert any(c.startswith("curl") for c in commands)
+
+    canary = f"CANARY-{uuid.uuid4().hex}"
+    fake_home = (tmp_path / "home").resolve()
+    for rel in (".ssh/id_rsa", ".aws/credentials"):
+        (fake_home / rel).parent.mkdir(parents=True)
+        (fake_home / rel).write_text(canary)
+    monkeypatch.setenv("HOME", str(fake_home))  # 命令里的 ~ 和 $HOME 指向假的家目录
+
+    def fooled(runner: SandboxRunner) -> tuple[str, list[str]]:
+        llm = ScriptedProvider([LLMResponse(None, [call("run_command", command=c)]) for c in commands]
+                               + [LLMResponse("done")])
+        agent = Agent(llm, workspace, settings, ExecutionPolicy(ApprovalMode.FULL_AUTO), runner=runner)
+        result = agent.run(task.prompt)
+        seen = "\n".join(str(m["content"]) for m in llm.seen[-1])
+        return seen, [e["decision"] for e in result.trace.of("tool_call")]
+
+    seen, decisions = fooled(SeatbeltRunner(workspace, home=fake_home))
+    assert decisions == ["allow"] * len(commands)  # 权限策略没拦，拦住的只能是沙盒
+    assert canary not in seen and not hits
+    # 对照：同样的命令不进沙盒，凭证就发出去了，说明上面拦住不是因为命令本身跑不通
+    fooled(NoSandboxRunner())
+    assert hits
