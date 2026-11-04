@@ -3,7 +3,7 @@ import re
 from pydantic import BaseModel, Field
 
 from boxcode.tools.base import Risk, Tool, ToolContext, ToolError, ToolResult, resolve_in_workspace
-from boxcode.tools.fs import SKIP_DIRS
+from boxcode.tools.fs import walk_workspace
 
 
 class Grep(Tool):
@@ -22,10 +22,11 @@ class Grep(Tool):
         except re.error as e:
             raise ToolError(f"正则写错了：{e}") from e
         root = resolve_in_workspace(ctx.workspace, params.path)
-        files = [root] if root.is_file() else sorted(root.rglob("*"))
+        files = [root] if root.is_file() else sorted(walk_workspace(ctx.workspace, root))
         hits: list[str] = []
         for f in files:
-            if not f.is_file() or any(part in SKIP_DIRS for part in f.parts):
+            # 符号链接一律不跟：指向工作区内的，目标文件本身会被搜到
+            if f.is_symlink() or not f.is_file():
                 continue
             try:
                 lines = f.read_text().splitlines()

@@ -67,11 +67,17 @@ class Tool(ABC):
     def run(self, ctx: ToolContext, params: Any) -> ToolResult: ...
 
 
+def in_workspace(workspace: Path, p: Path) -> bool:
+    """解析链接后是否仍在工作区里。"""
+    rp = p.resolve()
+    ws = workspace.resolve()
+    return rp == ws or ws in rp.parents
+
+
 def resolve_in_workspace(workspace: Path, path: str) -> Path:
     """相对路径按工作区解析；解析链接后必须仍在工作区里，否则拒绝（防止 ../ 和指向外面的链接）。"""
     p = (workspace / path).resolve()
-    ws = workspace.resolve()
-    if p != ws and ws not in p.parents:
+    if not in_workspace(workspace, p):
         raise ToolError(f"路径不在工作区内：{path}")
     return p
 

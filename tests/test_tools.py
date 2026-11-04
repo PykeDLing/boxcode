@@ -30,6 +30,17 @@ def test_symlink_escape_rejected(ctx: ToolContext, tmp_path: Path) -> None:
         ReadFile().run(ctx, ReadFile.Params(path="link.txt"))
 
 
+def test_grep_and_list_skip_links_out_of_workspace(ctx: ToolContext, tmp_path: Path) -> None:
+    # 沙盒里的命令能建这种链接；文件工具不在沙盒里，跟着链接就会读到工作区外
+    (tmp_path / "id_rsa").write_text("SECRET")
+    (ctx.workspace / "notes.txt").symlink_to(tmp_path / "id_rsa")
+    (ctx.workspace / "inside.txt").symlink_to(ctx.workspace / "a.py")
+    hits = Grep().run(ctx, Grep.Params(pattern=".")).text
+    assert "SECRET" not in hits and "a.py:1: x = 1" in hits
+    listing = ListDir().run(ctx, ListDir.Params()).text
+    assert "notes.txt" not in listing and "inside.txt" in listing
+
+
 def test_edit_requires_unique_match(ctx: ToolContext) -> None:
     (ctx.workspace / "b.py").write_text("a\na\n")
     with pytest.raises(ToolError):

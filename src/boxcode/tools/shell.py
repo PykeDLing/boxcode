@@ -6,8 +6,9 @@ from boxcode.tools.base import Risk, Target, Tool, ToolContext, ToolResult, trun
 class RunCommand(Tool):
     name = "run_command"
     description = (
-        "Run a shell command in the workspace inside a sandbox: it can only write inside the workspace "
-        "and the network is usually off. Use it to run tests, linters and scripts."
+        "Run a shell command in the workspace (the system prompt says what the sandbox allows). "
+        "Background processes are stopped when the command returns, so a server started with `&` "
+        "does not survive into the next call. Use it to run tests, linters and scripts."
     )
     risk = Risk.EXEC
 
