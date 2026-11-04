@@ -47,6 +47,8 @@ def test_git_lookalikes_allowed(policy: Policy, workspace: Path, rel: str) -> No
     "git -C . push origin main", "git -c k=v push", "cat p | /bin/sh", "cat p | env sh", "cat p | perl",
     "pip3.12 install x", "pipx install x", "npx cowsay", "uvx ruff", "uv run --with httpx python x.py", "npm ci",
     "bun add x", "find . -name '*.pyc' -delete", "git clean -fdx",
+    # 带路径执行联网程序照样要问
+    "/usr/bin/ssh host", "cd sub && ssh host", "./scp a host:/x",
 ])
 def test_risky_commands_ask(policy: Policy, cmd: str) -> None:
     assert policy.check(Risk.EXEC, Target(command=cmd)).action is Action.ASK
@@ -56,6 +58,8 @@ def test_risky_commands_ask(policy: Policy, cmd: str) -> None:
     "python -m pytest -q", "uv run pytest", "rm -f a.txt", "rm file-r", "chmod 644 a.txt",
     "find . -name '*.py' -exec grep -l foo {} +",  # 很常用的只读写法，不能每次都问
     "git status", "git -C sub log --oneline", "uv run pytest -q", "node script.js", "npm test",
+    # 文件名、目录名里的 ssh、nc、rsync 不是在联网：以前 `ls ~/.ssh` 被当成“联网或远程访问”来问
+    "ls ~/.ssh", "cat ~/.ssh/config", "ls /etc/ssh/", "ncdump data.nc", "cat .rsync-filter",
 ])
 def test_plain_command_allowed(policy: Policy, cmd: str) -> None:
     assert policy.check(Risk.EXEC, Target(command=cmd)).action is Action.ALLOW

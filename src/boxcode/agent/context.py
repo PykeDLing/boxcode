@@ -16,7 +16,7 @@ How to work:
 - Make the smallest change that solves the task. Use edit_file for changes to existing files.
 - After changing code, run the tests or a quick check with run_command, and fix what fails.
 - When you are done, reply with a short summary of what you changed and how you verified it, \
-and do not call any more tools.
+written in the same language as the task, and do not call any more tools.
 
 Environment:
 - {sandbox}
