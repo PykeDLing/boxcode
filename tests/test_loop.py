@@ -2,6 +2,7 @@
 
 import shutil
 import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from boxcode.agent import Agent, Status, deny_all
 from boxcode.agent.loop import Approver
 from boxcode.config import Settings
 from boxcode.llm.base import (
+    LLMCancelled,
     LLMResponse,
     LLMUnavailable,
     Message,
@@ -141,14 +143,14 @@ def test_every_tool_output_truncated_centrally(workspace: Path, settings: Settin
 class Unavailable:
     name = "down"
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> LLMResponse:
+    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: object = None) -> LLMResponse:
         raise LLMUnavailable("Claude 接口错误 529：overloaded")
 
 
 class Buggy:
     name = "buggy"
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> LLMResponse:
+    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: object = None) -> LLMResponse:
         raise KeyError("tool_use_id")  # Provider 自己没处理到的异常
 
 
@@ -243,7 +245,9 @@ def test_unsafe_workspace_refused(settings: Settings) -> None:
 def test_trace_write_failure_does_not_crash_run(workspace: Path, settings: Settings) -> None:
     # 轨迹是旁路记录：目录被删、磁盘满了，运行照样结束、照样返回结果
     class DeletesRuns(ScriptedProvider):
-        def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> LLMResponse:
+        def complete(
+            self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: object = None,
+        ) -> LLMResponse:
             shutil.rmtree(settings.runs_dir)
             settings.runs_dir.parent.chmod(0o500)  # 也建不回来
             return super().complete(messages, tools)
@@ -254,3 +258,53 @@ def test_trace_write_failure_does_not_crash_run(workspace: Path, settings: Setti
         settings.runs_dir.parent.chmod(0o700)
     assert result.status is Status.DONE and result.trace.write_error
     assert [e["event"] for e in result.trace.events][-1] == "run_end"
+
+
+class Hanging:
+    """模型接口卡住不返回，也不理会 cancel（例如不用流式的 OpenAI 兼容接口）。放开之后要调用工具写文件。"""
+
+    name = "hanging"
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.cancel_seen: object = None
+
+    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: object = None) -> LLMResponse:
+        self.cancel_seen = cancel
+        self.entered.set()
+        self.release.wait(30)
+        return LLMResponse(None, [call("write_file", path="late.txt", content="x")])
+
+
+def test_stop_does_not_wait_for_model_call(workspace: Path, settings: Settings) -> None:
+    # 以前按停止要等这次模型调用返回（Claude 一次回复可能要几分钟），界面一直显示“运行中”
+    llm, cancel = Hanging(), threading.Event()
+    agent = Agent(llm, workspace, settings, runner=NoSandboxRunner(), cancel=cancel)
+    results: list[Any] = []
+    worker = threading.Thread(target=lambda: results.append(agent.run("x")))
+    worker.start()
+    try:
+        assert llm.entered.wait(10)
+        cancel.set()
+        worker.join(3)
+        assert not worker.is_alive()
+        assert results[0].status is Status.CANCELLED and "模型调用" in results[0].final_message
+        assert llm.cancel_seen is cancel  # Provider 拿到了 cancel，能做到的（Claude 的流式接口）会自己断开
+    finally:
+        llm.release.set()
+    time.sleep(0.3)
+    assert not (workspace / "late.txt").exists()  # 停止之后才回来的回复被丢掉，它要的工具不执行
+    assert [e["event"] for e in results[0].trace.events][-1] == "run_end"
+
+
+class Cooperative:
+    name = "cooperative"
+
+    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: object = None) -> LLMResponse:
+        raise LLMCancelled  # Provider 自己先发现了停止
+
+
+def test_provider_noticing_cancel_ends_run_as_cancelled(workspace: Path, settings: Settings) -> None:
+    result = Agent(Cooperative(), workspace, settings, runner=NoSandboxRunner()).run("x")
+    assert result.status is Status.CANCELLED

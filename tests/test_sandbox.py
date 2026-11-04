@@ -188,7 +188,7 @@ def test_background_processes_killed_when_command_ends(workspace: Path, bg: str)
 
 
 def test_process_leaving_group_does_not_hang(workspace: Path) -> None:
-    # os.setsid 脱离进程组的进程杀不到，它还占着输出管道：以前会一直等它结束（这里是 30 秒）
+    # 不用沙盒时，os.setsid 脱离进程组的进程杀不到，它还占着输出管道：以前会一直等它结束（这里是 30 秒）
     escape = "/usr/bin/python3 -c 'import os, time; os.setsid(); time.sleep(30)'"
     for runner in _runners(workspace):
         t0 = time.monotonic()
@@ -198,6 +198,80 @@ def test_process_leaving_group_does_not_hang(workspace: Path) -> None:
         finally:
             with contextlib.suppress(ProcessLookupError, ValueError, FileNotFoundError):
                 os.kill(int((workspace / "bg.pid").read_text()), signal.SIGKILL)
+
+
+# 脱离进程组的几种写法：每一种都把自己的 pid 写进 esc.pid，然后在后台睡 30 秒
+LEAVE_GROUP = {
+    "setsid": "import os, time; os.setsid(); open('esc.pid', 'w').write(str(os.getpid())); time.sleep(30)",
+    "setpgid": "import os, time; os.setpgid(0, 0); open('esc.pid', 'w').write(str(os.getpid())); time.sleep(30)",
+    # 父进程马上退出：子进程挂到 launchd 下面，从进程树上也找不到它是谁起的
+    "posix_spawn_setsid": "import os; pid = os.posix_spawn('/bin/sleep', ['sleep', '30'], {}, setsid=True); "
+                          "open('esc.pid', 'w').write(str(pid))",
+}
+WAIT_FOR_PID = "while [ ! -s esc.pid ]; do sleep 0.05; done"
+
+
+def _kill_quietly(pid_file: Path) -> None:
+    with contextlib.suppress(ProcessLookupError, ValueError, FileNotFoundError):
+        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+
+@macos_only
+@pytest.mark.parametrize("how", sorted(LEAVE_GROUP))
+def test_processes_leaving_group_killed_with_command(workspace: Path, how: str) -> None:
+    # 以前杀不到：命令结束后它还在沙盒里跑，能接着改工作区、和文件工具抢着换符号链接
+    try:
+        r = SeatbeltRunner(workspace).run(f'/usr/bin/python3 -c "{LEAVE_GROUP[how]}" & {WAIT_FOR_PID}; echo ok',
+                                          workspace, 20)
+        assert r.ok and "ok" in r.stdout
+        assert _wait_dead(int((workspace / "esc.pid").read_text()))
+    finally:
+        _kill_quietly(workspace / "esc.pid")
+
+
+FORKER = """import os, sys, time
+os.setsid()
+while True:
+    if os.fork() == 0:
+        os.setsid()
+        time.sleep(30)
+        os._exit(0)
+    time.sleep(0.005)
+"""
+
+
+@macos_only
+def test_forking_escapee_killed_with_all_children(workspace: Path) -> None:
+    # 一边杀一边 fork：一轮里新冒出来的进程下一轮再杀，直到一个都不剩
+    token = uuid.uuid4().hex
+    (workspace / "forker.py").write_text(FORKER)
+    r = SeatbeltRunner(workspace).run(f"/usr/bin/python3 forker.py {token} & sleep 1; echo ok", workspace, 20)
+    assert r.ok
+    time.sleep(0.5)
+    left = subprocess.run(["pgrep", "-f", token], capture_output=True, text=True).stdout.split()
+    for pid in left:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(int(pid), signal.SIGKILL)
+    assert not left
+
+
+@macos_only
+def test_ending_command_spares_other_running_commands(workspace: Path) -> None:
+    # 每条命令的沙盒有自己的标记：一条命令结束时，同一个 runner 里同时在跑的另一条命令不会被一起杀掉
+    runner = SeatbeltRunner(workspace)
+    other: list[Any] = []
+    t = threading.Thread(target=lambda: other.append(runner.run("touch started; sleep 3; echo alive", workspace, 20)))
+    t.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not (workspace / "started").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        r = runner.run(f'/usr/bin/python3 -c "{LEAVE_GROUP["setsid"]}" & {WAIT_FOR_PID}; echo ok', workspace, 20)
+        assert r.ok and _wait_dead(int((workspace / "esc.pid").read_text()))
+        t.join(20)
+        assert other[0].ok and "alive" in other[0].stdout
+    finally:
+        _kill_quietly(workspace / "esc.pid")
 
 
 def test_timeout_kills_whole_group(workspace: Path) -> None:
@@ -457,6 +531,26 @@ def test_running_commands_killed_when_boxcode_exits(workspace: Path) -> None:
     )
     subprocess.run([sys.executable, "-c", script], check=True, timeout=30)
     assert _wait_dead(int((workspace / "main.pid").read_text()))
+
+
+@macos_only
+def test_escapees_killed_when_boxcode_exits(workspace: Path) -> None:
+    # BoxCode 退出时还在跑的命令：脱离了进程组的进程也要杀掉
+    cmd = f'/usr/bin/python3 -c "{LEAVE_GROUP["setsid"]}" & sleep 41'
+    script = (
+        "import threading, time\n"
+        "from pathlib import Path\n"
+        "from boxcode.sandbox import SeatbeltRunner\n"
+        f"ws = Path({str(workspace)!r})\n"
+        f"cmd = {cmd!r}\n"
+        "threading.Thread(target=SeatbeltRunner(ws).run, args=(cmd, ws, 60), daemon=True).start()\n"
+        "while not (ws / 'esc.pid').exists() or not (ws / 'esc.pid').read_text(): time.sleep(0.05)\n"
+    )
+    try:
+        subprocess.run([sys.executable, "-c", script], check=True, timeout=30)
+        assert _wait_dead(int((workspace / "esc.pid").read_text()))
+    finally:
+        _kill_quietly(workspace / "esc.pid")
 
 
 def test_exit_seen_after_deadline_is_not_a_timeout(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:

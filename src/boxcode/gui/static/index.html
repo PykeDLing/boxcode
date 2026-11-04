@@ -50,13 +50,13 @@
             <div class="field">
               <label class="label" for="f-workspace">工作区</label>
               <div class="input-row">
-                <input id="f-workspace" class="input mono" spellcheck="false">
+                <input id="f-workspace" class="input mono" spellcheck="false" autocorrect="off" autocapitalize="off">
                 <button type="button" class="btn" id="f-pick">选择…</button>
               </div>
             </div>
             <div class="field">
               <label class="label" for="f-task">任务</label>
-              <textarea id="f-task" class="input" rows="6" placeholder="例如：tests/test_stats.py 没通过，修好它"></textarea>
+              <textarea id="f-task" class="input" rows="6" autocorrect="off" autocapitalize="off" placeholder="例如：tests/test_stats.py 没通过，修好它"></textarea>
               <p class="hint">⌘↩ 开始</p>
             </div>
             <div class="field">
@@ -70,7 +70,7 @@
             </div>
             <div class="field">
               <label class="label" for="f-verify">自检命令<span class="optional">可选</span></label>
-              <input id="f-verify" class="input mono" spellcheck="false" placeholder="python -m pytest -q">
+              <input id="f-verify" class="input mono" spellcheck="false" autocorrect="off" autocapitalize="off" placeholder="python -m pytest -q">
               <p class="hint">模型说做完后在沙盒里跑一遍；没通过就把输出交回去继续修。</p>
             </div>
             <label class="check">
@@ -106,7 +106,7 @@
       </header>
       <div class="split">
         <div class="pane list-pane">
-          <input class="input" id="h-filter" placeholder="按任务或工作区筛选" spellcheck="false">
+          <input class="input" id="h-filter" placeholder="按任务或工作区筛选" spellcheck="false" autocorrect="off" autocapitalize="off">
           <ul class="run-list" id="h-list"></ul>
         </div>
         <div class="pane detail-pane" id="h-pane"></div>

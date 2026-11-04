@@ -41,7 +41,7 @@ def test_ask_user_pauses_spinner_and_eof_means_no(monkeypatch: pytest.MonkeyPatc
 class Unavailable:
     name = "down"
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> LLMResponse:
+    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: object = None) -> LLMResponse:
         raise LLMUnavailable("Claude 接口错误 529：overloaded")
 
 

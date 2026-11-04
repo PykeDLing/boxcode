@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import threading
 from collections.abc import Sequence
 from typing import Any
 
@@ -23,7 +24,9 @@ class ScriptedProvider:
         self.seen: list[list[Message]] = []  # 每次被调用时看到的对话，测试里用来断言
         self.tools: list[ToolSpec] = []
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> LLMResponse:
+    def complete(
+        self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: threading.Event | None = None,
+    ) -> LLMResponse:
         self.seen.append(list(messages))
         self.tools = list(tools)
         if not self._script:

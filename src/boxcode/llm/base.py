@@ -4,6 +4,7 @@ Agent 内部的对话历史、工具定义和模型回复都用这里的类型�
 所以主循环不认识任何一家的格式，换模型只需新写一个 Provider。
 """
 
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -99,8 +100,20 @@ class LLMProvider(Protocol):
     @property
     def name(self) -> str: ...
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> LLMResponse: ...
+    def complete(
+        self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: threading.Event | None = None,
+    ) -> LLMResponse:
+        """cancel 被设置时尽快放弃这次请求（抛 LLMCancelled），不再为剩下的输出付钱。
+
+        Agent 不靠这一点来及时停下：它在别的线程里调 complete，按停止后不等它返回。做不到中途放弃的
+        Provider（例如不用流式的接口）可以忽略 cancel，请求会在后台自己结束，结果被丢掉。
+        """
+        ...
 
 
 class LLMUnavailable(RuntimeError):
     """模型接口出错（超时、限流、鉴权失败）。"""
+
+
+class LLMCancelled(Exception):
+    """调用方取消了这次请求（界面上按了停止）。"""

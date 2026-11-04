@@ -1,5 +1,7 @@
 import os
 import shutil
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -8,7 +10,7 @@ from pydantic import ValidationError
 
 from boxcode.config import Settings
 from boxcode.sandbox import NoSandboxRunner
-from boxcode.tools import EditFile, Grep, ListDir, ReadFile, RunCommand, ToolContext, ToolError, WriteFile
+from boxcode.tools import EditFile, Grep, ListDir, ReadFile, RunCommand, ToolContext, ToolError, WriteFile, search
 from boxcode.tools import base as tools_base
 from boxcode.tools.fs import MAX_FILE_BYTES
 
@@ -228,6 +230,50 @@ def test_grep_reports_truncation_only_when_truncated(ctx: ToolContext) -> None:
     exact = Grep().run(ctx, Grep.Params(pattern="hit", path="five.txt", max_results=5)).text
     assert exact.count("hit") == 5 and "截断" not in exact
     assert "截断" in Grep().run(ctx, Grep.Params(pattern="hit", path="five.txt", max_results=4)).text
+
+
+# ^(a|a)*$ 在一行 "aaa...ab" 上要回溯 2**40 次：以前 grep 卡在这一行，总时间预算和“停止”都要等它算完
+CATASTROPHIC = r"^(a|a)*$"
+SLOW_LINE = "a" * 40 + "b"
+
+
+def test_grep_gives_up_on_catastrophic_line(ctx: ToolContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(search, "LINE_TIMEOUT_S", 0.2)
+    (ctx.workspace / "slow.txt").write_text(f"aaaa\n{SLOW_LINE}\naa\n")
+    t0 = time.monotonic()
+    out = Grep().run(ctx, Grep.Params(pattern=CATASTROPHIC, path="slow.txt")).text
+    assert time.monotonic() - t0 < 5
+    # 其他行照常匹配，超时的那一行按没匹配处理，并且告诉模型是哪一行
+    assert "slow.txt:1: aaaa" in out and "slow.txt:3: aa" in out and "slow.txt:2:" not in out
+    assert "1 行匹配超过 0.2 秒" in out and "slow.txt:2" in out
+
+
+def test_grep_time_budget_covers_slow_lines(ctx: ToolContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(search, "TIME_BUDGET_S", 1)
+    (ctx.workspace / "slow.txt").write_text(f"{SLOW_LINE}\n" * 20)  # 每行 1 秒，一共要 20 秒
+    t0 = time.monotonic()
+    out = Grep().run(ctx, Grep.Params(pattern=CATASTROPHIC, path="slow.txt")).text
+    assert time.monotonic() - t0 < 4 and "结果不完整" in out
+
+
+def test_stop_interrupts_grep_inside_a_line(ctx: ToolContext) -> None:
+    (ctx.workspace / "slow.txt").write_text(f"{SLOW_LINE}\n" * 20)
+    out: list[str] = []
+    worker = threading.Thread(target=lambda: out.append(
+        Grep().run(ctx, Grep.Params(pattern=CATASTROPHIC, path="slow.txt")).text))
+    worker.start()
+    # 匹配时要释放 GIL：re 一直占着，桌面界面的线程（包括“停止”按钮）在这一行算完之前都动不了
+    start = last = time.monotonic()
+    longest_gap = 0.0
+    while last - start < 0.5:
+        time.sleep(0.01)
+        now = time.monotonic()
+        longest_gap, last = max(longest_gap, now - last), now
+    stopped_at = time.monotonic()
+    ctx.cancel.set()
+    worker.join(10)
+    assert not worker.is_alive() and time.monotonic() - stopped_at < 3
+    assert "被停止" in out[0] and longest_gap < 0.3
 
 
 def test_read_refuses_fifo(ctx: ToolContext) -> None:

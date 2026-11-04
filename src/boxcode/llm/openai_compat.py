@@ -1,5 +1,6 @@
 """OpenAI 兼容接口：DeepSeek、通义千问、小米 MiMo、Ollama、vLLM 都走这一个。"""
 
+import threading
 from collections.abc import Sequence
 from typing import Any
 
@@ -8,6 +9,7 @@ import openai
 from boxcode.config import Settings
 from boxcode.llm.base import (
     AssistantMessage,
+    LLMCancelled,
     LLMResponse,
     LLMUnavailable,
     Message,
@@ -76,7 +78,12 @@ class OpenAICompatProvider:
         self.name = settings.model
         self._client = openai.OpenAI(base_url=settings.base_url, api_key=api_key, timeout=REQUEST_TIMEOUT_S)
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> LLMResponse:
+    def complete(
+        self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: threading.Event | None = None,
+    ) -> LLMResponse:
+        # 不用流式，请求发出去就没法中途放弃：只在发之前看一眼。按停止时 Agent 不等它返回
+        if cancel is not None and cancel.is_set():
+            raise LLMCancelled
         try:
             r = self._client.chat.completions.create(
                 model=self.name,
