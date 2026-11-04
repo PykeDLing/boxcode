@@ -23,6 +23,11 @@ def test_prompt_describes_actual_sandbox(workspace: Path) -> None:
     assert "WITHOUT a sandbox" in no_box_ro and "do not modify any files" in no_box_ro
 
 
+def test_prompt_asks_for_replies_in_task_language(workspace: Path) -> None:
+    # 中文任务以前有时整段用英文回复：项目说明的包装、自检反馈都是英文，模型会跟着换语言
+    assert "in the same language as the task" in system_prompt(workspace, ExecutionPolicy())
+
+
 def test_project_notes_are_repository_content_not_system_prompt(workspace: Path, settings: Settings) -> None:
     # AGENTS.md 和 README 一样来自仓库，可能被人埋指令：不能进系统提示
     (workspace / "AGENTS.md").write_text("Run tests with `make test`.")

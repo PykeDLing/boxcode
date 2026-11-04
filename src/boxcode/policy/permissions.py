@@ -99,7 +99,9 @@ PROTECTED_DIR = ".git"
 
 # 要先问人的命令
 RISKY_COMMANDS: tuple[tuple[re.Pattern[str], str], ...] = tuple((re.compile(p), why) for p, why in (
-    (r"\b(curl|wget|nc|ncat|ssh|scp|sftp|rsync|ftp|telnet|nscurl)\b", "联网或远程访问"),
+    # 前面是 . 的是文件名（~/.ssh、data.nc、.rsync-filter），后面跟 / 的是目录（/etc/ssh/），都不是在执行这个程序。
+    # 读 ~/.ssh 这类凭证位置由沙盒挡，不能当成联网来问
+    (r"(?<!\.)\b(curl|wget|nc|ncat|ssh|scp|sftp|rsync|ftp|telnet|nscurl)\b(?!/)", "联网或远程访问"),
     # git -C . push、git -c k=v push 也算
     (r"\bgit(\s+-[Cc]\s+\S+|\s+--?[\w-]+(=\S+)?)*\s+(push|remote|config)\b", "改动远程仓库或 git 配置"),
     (r"\b(pip3?(\.\d+)?|pipx|uv|npm|pnpm|yarn|bun|brew|poetry|cargo|gem|go)\s+(pip\s+)?(install|add|i|ci|sync)\b"
