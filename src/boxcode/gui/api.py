@@ -12,7 +12,7 @@
 - run_finished、eval_progress、eval_finished
 
 按“停止”会设置这次运行的取消信号：正在执行的命令立刻被杀掉，等着确认的调用一律拒绝，
-下一次调用模型之前就以 cancelled 结束。正在进行的那一次模型调用不会被打断。
+正在进行的模型调用也不再等（见 Agent._complete），这次运行马上以 cancelled 结束。
 """
 
 import contextlib

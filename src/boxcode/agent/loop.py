@@ -20,6 +20,7 @@ from pydantic import BaseModel, ValidationError
 from boxcode.agent.context import system_prompt, task_message
 from boxcode.config import Settings
 from boxcode.llm.base import (
+    LLMCancelled,
     LLMProvider,
     LLMResponse,
     LLMUnavailable,
@@ -28,6 +29,7 @@ from boxcode.llm.base import (
     SystemMessage,
     ToolCall,
     ToolResultMessage,
+    ToolSpec,
     UserMessage,
 )
 from boxcode.paths import canonical
@@ -41,6 +43,8 @@ from boxcode.trace import TraceRecorder
 Approver = Callable[[Tool[Any], BaseModel, Decision], bool]
 
 TRUNCATED_CALL = "输出撞上了 max_tokens，参数可能不完整，没有执行。请把大段内容拆成几次较小的写入。"
+# 等模型回复时每隔这么久看一次有没有按停止
+CANCEL_POLL_S = 0.1
 
 
 class Status(StrEnum):
@@ -114,6 +118,7 @@ class Agent:
                             workspace=str(self.workspace), verify=verify_command)
             return self._loop(state, task, verify_command)
         except KeyboardInterrupt:
+            self.cancel.set()  # 后台线程里还没回来的模型请求也断开
             self._finish(Status.CANCELLED, "用户中断（Ctrl-C）")
             raise
         except Exception as e:
@@ -130,7 +135,9 @@ class Agent:
             state.turn += 1
             t0 = time.monotonic()
             try:
-                resp = self.llm.complete(state.messages, specs)
+                resp = self._complete(state.messages, specs)
+            except LLMCancelled:
+                return self._finish(Status.CANCELLED, "已停止（正在进行的模型调用被放弃）")
             except LLMUnavailable as e:
                 self.trace.emit("llm_error", turn=state.turn, error=str(e))
                 return self._finish(Status.ERROR, str(e))
@@ -159,6 +166,35 @@ class Agent:
             state.fix_rounds += 1
             state.messages.append(UserMessage(feedback))
         return self._finish(Status.MAX_TURNS, None)
+
+    def _complete(self, messages: Sequence[Message], specs: Sequence[ToolSpec]) -> LLMResponse:
+        """在单独的线程里调模型，按了停止就不再等它，抛 LLMCancelled。
+
+        模型接口是阻塞的网络请求（Claude 一次回复可能要几分钟），在当前线程里调，停止要等它返回才生效。
+        放弃的请求留在后台线程里：Provider 支持的话（Claude 的流式接口）会看到 cancel、立刻断开连接，
+        不支持的等它自己结束，结果丢掉。对话历史传一份拷贝，后台线程不会读到之后的修改。
+        """
+        outcome: list[LLMResponse | BaseException] = []
+        done = threading.Event()
+
+        def call() -> None:
+            try:
+                outcome.append(self.llm.complete(tuple(messages), specs, cancel=self.cancel))
+            except BaseException as e:  # 交给调用方的线程处理，包括 BoxCode 自己的 bug
+                outcome.append(e)
+            finally:
+                done.set()
+
+        threading.Thread(target=call, name="boxcode-llm", daemon=True).start()
+        while not done.wait(CANCEL_POLL_S):
+            if self.cancel.is_set():
+                raise LLMCancelled
+        if self.cancel.is_set():  # 回复和停止几乎同时到：照样算停止，不再执行它要的工具
+            raise LLMCancelled
+        result = outcome[0]
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     def _record_llm_call(self, turn: int, resp: LLMResponse, latency_s: float) -> None:
         self.trace.emit("llm_call", turn=turn, latency_s=round(latency_s, 3),

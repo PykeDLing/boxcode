@@ -12,7 +12,7 @@ import pytest
 from boxcode.config import Settings
 from boxcode.gui import api as gui_api
 from boxcode.gui.api import EXPOSED, GuiApi, bridge_functions
-from boxcode.gui.app import page_html
+from boxcode.gui.app import TEXT_SUBSTITUTIONS, disable_text_substitutions, page_html
 from boxcode.llm.base import LLMProvider, LLMResponse, LLMUnavailable
 from boxcode.llm.scripted import ScriptedProvider, call
 from boxcode.trace import TraceRecorder, read_trace
@@ -56,6 +56,29 @@ def test_page_html_inlines_assets_with_fresh_nonce() -> None:
     assert len(nonces) == 1  # CSP 和脚本标签用的是同一个
     assert "default-src 'none'" in html and "window.boxcode" in html and "--accent" in html
     assert nonces.isdisjoint(re.findall(r"nonce-([\w-]+)'", page_html()))  # 每次打开窗口都换
+
+
+def test_text_fields_not_autocorrected() -> None:
+    # 任务和自检命令里常有 shell 命令：自动纠正、自动大写会把它改坏
+    html = page_html()
+    fields = re.findall(r"<(?:input|textarea)\b[^>]*>", html)
+    text_fields = [f for f in fields if 'type="checkbox"' not in f]
+    assert len(text_fields) == 4
+    assert all('autocorrect="off"' in f and 'autocapitalize="off"' in f for f in text_fields)
+
+
+@macos_only
+def test_smart_quotes_disabled_only_for_this_process() -> None:
+    # 系统默认开着“智能引号和破折号”：' " -- 会被换成 ‘’ “” —，命令就坏了
+    from Foundation import NSBundle, NSUserDefaults  # type: ignore[import-untyped]
+
+    disable_text_substitutions()
+    defaults = NSUserDefaults.standardUserDefaults()
+    assert all(defaults.objectForKey_(k) is not None and not defaults.boolForKey_(k) for k in TEXT_SUBSTITUTIONS)
+    # 只登记在这个进程的内存里，不改用户的偏好设置
+    bundle = NSBundle.mainBundle().bundleIdentifier()
+    saved = defaults.persistentDomainForName_(bundle) if bundle else None
+    assert not any(k in (saved or {}) for k in TEXT_SUBSTITUTIONS)
 
 
 def test_trace_listener_and_read_back(tmp_path: Path) -> None:
@@ -170,13 +193,41 @@ def test_stop_denies_pending_approval_and_ends_run(settings: Settings, tmp_path:
 
 
 @macos_only
+def test_stop_during_model_call_finishes_run(settings: Settings, tmp_path: Path, workspace: Path) -> None:
+    # 以前按停止要等正在进行的模型调用返回，页面一直显示“运行中”
+    entered, release = threading.Event(), threading.Event()
+
+    class Hanging:
+        name = "hanging"
+
+        def complete(self, messages: Any, tools: Any, *, cancel: object = None) -> LLMResponse:
+            entered.set()
+            release.wait(WAIT_S)
+            return LLMResponse("done")
+
+    page = Page()
+    api = GuiApi(settings, TASKS, tmp_path / "results", page.push, make_llm=lambda _: Hanging())
+    try:
+        assert api.start_run({"task": "x", "workspace": str(workspace)})["ok"]
+        assert entered.wait(WAIT_S)
+        t0 = time.monotonic()
+        api.stop_run()
+        assert page.finished.wait(5) and time.monotonic() - t0 < 3
+        assert page.of("run_finished")[0]["status"] == "cancelled"
+        assert api.start_run({"task": "y", "workspace": str(workspace)})["ok"]  # 马上就能开始下一个任务
+    finally:
+        release.set()
+        api.shutdown()
+
+
+@macos_only
 def test_one_run_at_a_time(settings: Settings, tmp_path: Path, workspace: Path) -> None:
     release = threading.Event()
 
     class Slow:
         name = "slow"
 
-        def complete(self, messages: Any, tools: Any) -> LLMResponse:
+        def complete(self, messages: Any, tools: Any, *, cancel: object = None) -> LLMResponse:
             release.wait(WAIT_S)
             return LLMResponse("done")
 

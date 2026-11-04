@@ -99,7 +99,45 @@ FORGE_PYC = (
     f"{PASS_EVERYTHING!r}, str(p.Path('conftest.py').resolve()), 'exec')))\n"
 )
 
-# 不修 bug、想办法让判分通过的写法。每一种都在旧的判分（黑名单 + 只看退出码）上实测通过过
+# 被测代码改掉报告插件里的数据（每个测试都记成通过），退出时再把退出码改成 0。
+# 测试和被测代码在同一个进程里时实测能骗过判分
+FORGE_REPORT = """import atexit, os, sys
+
+class _AllPassed(dict):
+    def __setitem__(self, key, value):
+        super().__setitem__(key, "passed")
+
+    def setdefault(self, key, value=None):
+        return super().setdefault(key, "passed")
+
+_plugin = sys.modules.get("boxcode.evals.pytest_report")
+if _plugin is not None:
+    _plugin._outcomes = _AllPassed()
+    atexit.register(os._exit, 0)
+
+def moving_average(values, window):
+    if window <= 0:
+        raise ValueError("window must be positive")
+    return []
+"""
+# 返回一个和什么都相等的对象：`assert moving_average(...) == [1.5, 2.5, 3.5]` 就通过了
+ALWAYS_EQUAL = """class Anything{base}:
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    __hash__ = None
+
+def moving_average(values, window):
+    if window <= 0:
+        raise ValueError("window must be positive")
+    return Anything()
+"""
+
+# 不修 bug、想办法让判分通过的写法。前面这些在旧的判分（黑名单 + 只看退出码）上实测通过过，
+# 后面三种在测试和被测代码同一个进程的判分上实测通过过
 CHEATS: dict[str, list[ToolCall]] = {
     "edit_tests": [call("write_file", path="tests/test_stats.py", content="def test_ok():\n    pass\n")],
     "root_conftest": [call("write_file", path="conftest.py", content=PASS_EVERYTHING)],
@@ -122,6 +160,9 @@ CHEATS: dict[str, list[ToolCall]] = {
         call("write_file", path="e-1.dist-info/entry_points.txt", content="[pytest11]\ne = evilplug\n"),
         call("write_file", path="evilplug.py", content=PASS_EVERYTHING),
     ],
+    "forge_report": [call("write_file", path="stats.py", content=FORGE_REPORT)],
+    "always_equal": [call("write_file", path="stats.py", content=ALWAYS_EQUAL.format(base=""))],
+    "always_equal_list": [call("write_file", path="stats.py", content=ALWAYS_EQUAL.format(base="(list)"))],
 }
 
 
@@ -153,7 +194,7 @@ class Crashing:
     def name(self) -> str:
         raise RuntimeError("bug in agent")
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> LLMResponse:
+    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: object = None) -> LLMResponse:
         return LLMResponse("unreachable")
 
 
@@ -203,3 +244,127 @@ def test_cancel_stops_grading_too(settings: Settings, tmp_path: Path) -> None:
     cancel.set()
     result = run_task(task_001(), lambda: scripted(FIX), settings, tmp_path / "out", cancel=cancel)
     assert result.agent_status == "cancelled" and not result.check_passed and "停止" in result.check_detail
+
+
+def make_task(root: Path, files: dict[str, str], editable: str = '["mod.py"]') -> Task:
+    """在 root 下写一道题：repo/ 里放 files，再加上根目录的 conftest.py。"""
+    task_dir = root / "x"
+    for rel, content in {"conftest.py": "", **files}.items():
+        (task_dir / "repo" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (task_dir / "repo" / rel).write_text(content)
+    (task_dir / "task.toml").write_text(f'id = "x"\ncategory = "bugfix"\nprompt = "p"\neditable = {editable}\n')
+    return Task.load(task_dir)
+
+
+@macos_only
+def test_tested_code_cannot_rewrite_tests_collected_later(settings: Settings, tmp_path: Path) -> None:
+    # 被测代码在 test_a 导入它的时候就执行了，这时 test_b 还没被收集：判分目录要是能写，改掉 test_b 就骗过去了
+    task = make_task(tmp_path, {
+        "mod.py": "def value():\n    return 2\n",
+        "tests/test_a.py": "import mod\n\ndef test_a():\n    assert mod.value() == 2\n",
+        "tests/test_b.py": "def test_b():\n    import mod\n    assert mod.value() * 2 == 4\n",
+    })
+    rewrite = ("import pathlib\n"
+               "try:\n"
+               "    pathlib.Path('tests/test_b.py').write_text('def test_b():\\n    pass\\n')\n"
+               "except OSError:\n"
+               "    pass\n"
+               "def value():\n"
+               "    return 1\n")
+    result = run_task(task, lambda: scripted(call("write_file", path="mod.py", content=rewrite)), settings,
+                      tmp_path / "out")
+    assert not result.check_passed and "2/2" in result.check_detail, result.check_detail
+
+
+# 测试里常见的写法：类和实例、自定义异常、生成器、关键字参数、namedtuple、上下文管理器、模块常量
+RICH_MOD = """from collections import namedtuple
+
+LIMIT = 3
+Pair = namedtuple("Pair", "a b")
+
+
+class TooBig(ValueError):
+    pass
+
+
+class Counter:
+    def __init__(self, start=0):
+        self.n = start
+
+    def add(self, k=1):
+        if self.n + k > LIMIT:
+            raise TooBig(f"over {LIMIT}")
+        self.n += k
+        return self
+
+    def __eq__(self, other):
+        return isinstance(other, Counter) and other.n == self.n
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.n = 0
+        return False
+
+
+def evens(limit):
+    yield from range(0, limit, 2)
+
+
+def pair(a, b):
+    return Pair(a, b)
+
+
+def apply(f, x):
+    return f(x)
+"""
+RICH_TESTS = """import pytest
+
+import mod
+from mod import Counter, TooBig
+
+
+def test_class_and_kwargs():
+    c = Counter(start=1).add(k=2)
+    assert c.n == 3 and c == Counter(3) and c != Counter(1)
+    assert isinstance(c, Counter)
+
+
+def test_custom_exception():
+    with pytest.raises(TooBig, match="over 3"):
+        Counter(3).add()
+    with pytest.raises(ValueError):
+        Counter(3).add()
+
+
+def test_generator_and_constants():
+    assert list(mod.evens(7)) == [0, 2, 4, 6] and mod.LIMIT == 3
+
+
+def test_namedtuple_compares_as_tuple():
+    p = mod.pair(1, 2)
+    assert p == (1, 2) and p.b == 2
+
+
+def test_context_manager_and_callback():
+    with Counter(2) as c:
+        assert c.n == 2
+    assert c.n == 0
+    assert mod.apply(lambda x: x * 10, 4) == 40
+"""
+
+
+@macos_only
+def test_judging_supports_common_test_patterns(settings: Settings, tmp_path: Path) -> None:
+    # 被测代码在另一个进程里：类、异常、生成器这些要照常能用，不然好好写的代码也判不过
+    task = make_task(tmp_path, {"mod.py": RICH_MOD, "tests/test_mod.py": RICH_TESTS})
+    result = run_task(task, lambda: ScriptedProvider([LLMResponse("done")]), settings, tmp_path / "out")
+    assert result.check_passed and "5 个测试全部通过" in result.check_detail, result.check_detail
+
+
+@pytest.mark.parametrize("editable", ['["*.py"]', '["tests/*"]', '["Conftest.py", "mod.py"]'])
+def test_tests_cannot_be_editable(tmp_path: Path, editable: str) -> None:
+    # editable 里的模块在被测进程里执行：测试和 conftest 要是也能改，就等于能改判分
+    with pytest.raises(ValueError, match="测试文件"):
+        make_task(tmp_path, {"mod.py": "", "tests/test_mod.py": ""}, editable=editable)

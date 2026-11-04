@@ -11,6 +11,7 @@ dependencies = [
     "typer>=0.15",
     "rich>=13.9",
     "anthropic>=1.0",
+    "regex>=2024.11.6",
 ]
 
 [project.scripts]
@@ -27,6 +28,7 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "pywebview>=6.2.1",
+    "types-regex>=2026.9.29.20261030",
 ]
 
 [build-system]

@@ -13,6 +13,7 @@
 
 import json
 import secrets
+import sys
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,28 @@ def page_html(token: str = "") -> str:
     return html.replace("/*{{script}}*/", static.joinpath("app.js").read_text(encoding="utf-8"))
 
 
+# macOS 默认开着“智能引号和破折号”、自动纠正、文本替换，WKWebView 里的输入框也照做：
+# 在任务、自检命令里敲 `python -c 'print(1)' --verbose`，会变成 ‘print(1)’ 和 —verbose，命令就坏了
+TEXT_SUBSTITUTIONS = (
+    "WebAutomaticQuoteSubstitutionEnabled",
+    "WebAutomaticDashSubstitutionEnabled",
+    "WebAutomaticSpellingCorrectionEnabled",
+    "WebAutomaticTextReplacementEnabled",
+)
+
+
+def disable_text_substitutions() -> None:
+    """只在这个进程里关掉（registerDefaults 不写进偏好设置），要在 WebKit 第一次读设置之前调用。
+    用户自己给这个程序设过这些开关的，以用户的为准。"""
+    if sys.platform != "darwin":
+        return
+    from Foundation import NSUserDefaults  # type: ignore[import-untyped]  # pywebview 在 macOS 上依赖 pyobjc
+
+    NSUserDefaults.standardUserDefaults().registerDefaults_(dict.fromkeys(TEXT_SUBSTITUTIONS, False))
+
+
 def launch(settings: Settings, tasks_dir: Path, results_dir: Path, debug: bool = False) -> None:
+    disable_text_substitutions()
     windows: list[webview.Window] = []
 
     def push(kind: str, data: dict[str, Any]) -> None:

@@ -9,10 +9,12 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Protocol
+
+from boxcode.sandbox.procs import kill_sandbox
 
 # 传给命令的环境变量白名单。其他一律不传：模型的 API key、SSH_AUTH_SOCK、各种云凭证都在环境变量里
 ENV_ALLOWLIST = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "VIRTUAL_ENV")
@@ -50,8 +52,10 @@ class SandboxRunner(Protocol):
 
     def run(
         self, command: str, cwd: Path, timeout_s: float, *,
-        cancel: threading.Event | None = None, env: Mapping[str, str] | None = None,
-    ) -> CommandResult: ...
+        cancel: threading.Event | None = None, env: Mapping[str, str] | None = None, pass_fds: Sequence[int] = (),
+    ) -> CommandResult:
+        """pass_fds：交给命令的文件描述符（编号不变）。它们归命令所有：启动之后（启动失败也一样）父进程这边的会被关掉。"""
+        ...
 
 
 class _Capture:
@@ -82,42 +86,52 @@ class _Capture:
         return f"{head}\n\n... [省略 {self.dropped} 字节] ...\n\n{tail}"
 
 
-def _kill_group(pgid: int) -> None:
+def _kill_all(pgid: int, sandbox_marker: str | None) -> None:
+    """杀掉整个进程组；在 Seatbelt 沙盒里跑的，再把沙盒里剩下的进程（脱离了进程组的）也杀掉。"""
     with contextlib.suppress(ProcessLookupError, PermissionError):  # 进程组已经空了
         os.killpg(pgid, signal.SIGKILL)
+    if sandbox_marker is not None:
+        kill_sandbox(sandbox_marker)
 
 
-# 正在跑的命令的进程组。BoxCode 退出时（例如关掉桌面窗口，后台线程是 daemon，等不到它们的 finally）全部杀掉，
-# 否则判分里死循环的 pytest 会在 BoxCode 退出后一直跑下去：超时是父进程管的，父进程已经没了
-_live_groups: set[int] = set()
+# 正在跑的命令：进程组 → 沙盒标记。BoxCode 退出时（例如关掉桌面窗口，后台线程是 daemon，等不到它们的 finally）
+# 全部杀掉，否则判分里死循环的 pytest 会在 BoxCode 退出后一直跑下去：超时是父进程管的，父进程已经没了
+_live: dict[int, str | None] = {}
 _live_lock = threading.Lock()
 
 
 @atexit.register
-def _kill_live_groups() -> None:
+def _kill_live() -> None:
     with _live_lock:
-        for pgid in list(_live_groups):
-            _kill_group(pgid)
+        for pgid, marker in list(_live.items()):
+            _kill_all(pgid, marker)
 
 
 def run_process(
     argv: list[str], cwd: Path, timeout_s: float, *,
     cancel: threading.Event | None = None, env: Mapping[str, str] | None = None,
-    max_capture_bytes: int = MAX_CAPTURE_BYTES,
+    max_capture_bytes: int = MAX_CAPTURE_BYTES, sandbox_marker: str | None = None, pass_fds: Sequence[int] = (),
 ) -> CommandResult:
     """执行命令并收集输出。
 
     - 命令放在单独的进程组里，主进程一结束（或超时、被取消）就整组杀掉：它留在后台的进程（`sleep 100 &`、
       开了没关的服务器）不会占着输出管道让命令一直等到超时，也不会在 Agent 接下来用文件工具时还在后台改文件
-    - 用 os.setsid 脱离了进程组的进程杀不到，它可能还占着管道，所以收尾最多再读 DRAIN_S 秒
+    - sandbox_marker：命令在带这个标记的 Seatbelt 沙盒里（见 procs.py）。用 setsid、setpgid 脱离了进程组的
+      进程也一起杀掉。不用沙盒时（--dangerously-no-sandbox）这种进程杀不到，它可能还占着管道，
+      所以收尾最多再读 DRAIN_S 秒
     - 两个管道在同一个线程里用 selectors 读，输出只保留开头和结尾，内存占用有上限
+    - pass_fds 交给子进程后在这边关掉：比如判分时两个进程之间的管道，一边退出了另一边才读得到 EOF
     """
-    p = subprocess.Popen(
-        argv, cwd=cwd, env=clean_env(env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    try:
+        p = subprocess.Popen(
+            argv, cwd=cwd, env=clean_env(env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True, pass_fds=tuple(pass_fds),
+        )
+    finally:
+        for fd in pass_fds:
+            os.close(fd)
     with _live_lock:
-        _live_groups.add(p.pid)
+        _live[p.pid] = sandbox_marker
     pipes: list[IO[bytes]] = [p.stdout, p.stderr]  # type: ignore[list-item]  # 传了 PIPE，一定不是 None
     out, err = _Capture(max_capture_bytes), _Capture(max_capture_bytes)
     deadline = time.monotonic() + timeout_s
@@ -136,7 +150,7 @@ def run_process(
                 timed_out = not exited and now >= deadline
                 cancelled = not exited and not timed_out and cancel is not None and cancel.is_set()
                 if exited or timed_out or cancelled:
-                    _kill_group(p.pid)
+                    _kill_all(p.pid, sandbox_marker)
                     drain_until = now + DRAIN_S
             elif now >= drain_until or not sel.get_map():
                 break
@@ -152,13 +166,13 @@ def run_process(
                 else:
                     sel.unregister(key.fileobj)
     finally:
-        _kill_group(p.pid)
+        _kill_all(p.pid, sandbox_marker)
         sel.close()
         for f in pipes:
             f.close()
         p.wait()
         with _live_lock:
-            _live_groups.discard(p.pid)
+            _live.pop(p.pid, None)
     stdout, stderr = out.text(), err.text()
     interrupted = timed_out or cancelled
     return CommandResult(exit_code=-1 if interrupted else p.returncode, stdout=stdout, stderr=stderr,
@@ -172,9 +186,9 @@ class NoSandboxRunner:
 
     def run(
         self, command: str, cwd: Path, timeout_s: float, *,
-        cancel: threading.Event | None = None, env: Mapping[str, str] | None = None,
+        cancel: threading.Event | None = None, env: Mapping[str, str] | None = None, pass_fds: Sequence[int] = (),
     ) -> CommandResult:
-        return run_process(["/bin/sh", "-c", command], cwd, timeout_s, cancel=cancel, env=env)
+        return run_process(["/bin/sh", "-c", command], cwd, timeout_s, cancel=cancel, env=env, pass_fds=pass_fds)
 
 
 def default_runner(

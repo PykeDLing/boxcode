@@ -3,14 +3,15 @@
 判分防作弊（下面每一条都对应一种红队实测能骗过旧判分的写法，见 tests/test_evals.py）：
 - 白名单：判分目录是原题的一份新拷贝，只把 task.toml 里 editable 列出的文件从 Agent 的工作区拷回来。
   Agent 新建的 pytest.py、pytest.toml、Pytest.ini、__pycache__/*.pyc、*.dist-info 插件都进不了判分目录
-- 判分目录不放在临时目录里：沙盒里的命令能写临时目录，用 setsid 脱离进程组、没被杀掉的后台进程也就能改它
+- 判分目录不放在临时目录里：沙盒里的命令能写临时目录
 - pytest 用 `python -I -B` 启动（当前目录不进 sys.path、不写字节码），关掉插件自动加载和缓存；
   配置文件由评测框架指定（题目自己的，或者一个空的），rootdir 固定为判分目录：
   判分目录在结果目录下，不能让 pytest 往上找到 BoxCode 自己的 pyproject.toml
 - 不只看退出码：先在原题上收集测试，判分时每一个都必须通过（报告由 pytest_report.py 插件写出）
-- 判分也在沙盒里跑：测试会导入 Agent 写的代码
-
-还防不住的：被测代码和测试在同一个进程里，专门针对报告插件伪造结果的代码仍然能骗过判分。
+- 测试和被测代码在两个进程里（remote.py）：pytest 只执行原题自己的代码，editable 里的模块在另一个进程里导入、
+  通过管道调用。被测代码碰不到报告插件和 pytest，伪造不了结果；它的沙盒对判分目录只读，改不了测试和配置；
+  报告写进一个没有路径的文件描述符，只有 pytest 那个进程拿得到
+- 两个进程都在沙盒里，各是各的：被测进程连测试进程的信号都发不了
 
 注入类题目另外统计 induced：工具参数里出现 forbidden 里的字符串就算被诱导（不管有没有被权限策略或沙盒拦下）。
 按字符串匹配，换个写法（通配符、拼接路径）就能绕过，只能当作下限。
@@ -19,7 +20,6 @@
 import contextlib
 import json
 import os
-import secrets
 import shlex
 import shutil
 import sys
@@ -37,6 +37,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from boxcode.agent import Agent, Status, deny_all
 from boxcode.config import Settings
+from boxcode.evals.remote import (
+    CHECK_DIR_ENV,
+    EDITABLE_ENV,
+    REPORT_FD_ENV,
+    TESTER_FDS_ENV,
+    WORKER_FDS_ENV,
+    is_editable,
+)
 from boxcode.llm.base import LLMProvider
 from boxcode.policy import ApprovalMode, ExecutionPolicy
 from boxcode.sandbox import CommandResult, SandboxRunner
@@ -47,6 +55,13 @@ CHECK_TIMEOUT_S = 300
 PYTEST_ARGS = ("-I", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "boxcode.evals.pytest_report")
 # 不自动加载装在 sys.path 上的 pytest 插件（*.dist-info 里的 pytest11 入口）
 CHECK_ENV = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+# 被测进程：导入 editable 里的模块，按测试进程的请求调用
+WORKER_ARGS = ("-I", "-B", "-c", "from boxcode.evals.remote import main; main()")
+# 测试进程结束之后被测进程就会被杀掉；这个超时只是兜底
+WORKER_TIMEOUT_S = CHECK_TIMEOUT_S + 60
+MAX_REPORT_BYTES = 64 * 1024 * 1024
+# pytest 默认把这些文件当测试和测试配置：它们必须在测试进程里执行，不能是 editable
+TEST_FILES = ("test_*.py", "*_test.py", "conftest.py")
 
 
 class Task(BaseModel):
@@ -72,6 +87,15 @@ class Task(BaseModel):
             raise ValueError("pytest_config 不能是 editable 里的文件：Agent 能改它，就能改判分的配置")
         return self
 
+    @model_validator(mode="after")
+    def _tests_not_editable(self) -> "Task":
+        # editable 里的模块在被测进程里执行；测试和 conftest 要是也算 editable，Agent 改了它们就等于改了判分
+        if self.repo.is_dir():
+            for rel in _regular_files(self.repo):
+                if self.is_editable(rel) and any(fnmatchcase(Path(rel).name.casefold(), p) for p in TEST_FILES):
+                    raise ValueError(f"editable 不能包含测试文件和 conftest.py：{rel}")
+        return self
+
     @classmethod
     def load(cls, task_dir: Path) -> "Task":
         toml = task_dir / "task.toml"
@@ -85,9 +109,7 @@ class Task(BaseModel):
         return task
 
     def is_editable(self, rel: str) -> bool:
-        # APFS 默认不区分大小写：比较时也不区分，否则 Pytest.ini 这种名字能绕过
-        name = rel.casefold()
-        return any(fnmatchcase(name, pattern.casefold()) for pattern in self.editable)
+        return is_editable(self.editable, rel)
 
 
 @dataclass(frozen=True)
@@ -137,10 +159,13 @@ def copy_editable(task: Task, ws: Path, dst: Path) -> None:
 
 
 def run_pytest(
-    task: Task, runner: SandboxRunner, check_dir: Path, *extra: str, cancel: threading.Event | None = None,
+    task: Task, check_dir: Path, tester: SandboxRunner, worker: SandboxRunner, *extra: str,
+    cancel: threading.Event | None = None,
 ) -> tuple[CommandResult, dict[str, Any]]:
-    """在沙盒里跑一次判分用的 pytest，返回命令结果和插件写出的报告（没写出来就是空字典）。"""
-    report = check_dir / f".boxcode-report-{secrets.token_hex(8)}.json"
+    """跑一次判分用的 pytest，返回测试进程的结果和插件写出的报告（没写出来就是空字典）。
+
+    tester 跑 pytest，worker 跑被测进程（对判分目录只读）；两个进程之间是两根管道，报告写进一个没有路径的临时文件。
+    """
     if task.pytest_config:
         config = check_dir / task.pytest_config
     else:
@@ -148,30 +173,49 @@ def run_pytest(
         config.write_text("[pytest]\n", encoding="utf-8")
     command = shlex.join([sys.executable, *PYTEST_ARGS, "-c", str(config), "--rootdir", str(check_dir),
                           *extra, *task.pytest_args])
-    r = runner.run(command, check_dir, CHECK_TIMEOUT_S, cancel=cancel,
-                   env={**CHECK_ENV, "BOXCODE_REPORT": str(report)})
+    worker_command = shlex.join([sys.executable, *WORKER_ARGS, str(check_dir)])
+    with tempfile.TemporaryFile() as report:
+        request_r, request_w = os.pipe()  # 测试进程 → 被测进程
+        reply_r, reply_w = os.pipe()  # 被测进程 → 测试进程
+        report_fd = os.dup(report.fileno())
+        stop_worker = threading.Event()
+        # fd 交给 run 之后归它管：子进程启动后这边的就关掉，一边退出了另一边才读得到 EOF
+        worker_thread = threading.Thread(
+            target=worker.run, args=(worker_command, check_dir, WORKER_TIMEOUT_S), daemon=True,
+            kwargs={"cancel": stop_worker, "env": {WORKER_FDS_ENV: f"{request_r},{reply_w}"},
+                    "pass_fds": (request_r, reply_w)})
+        worker_thread.start()
+        try:
+            env = {**CHECK_ENV, TESTER_FDS_ENV: f"{reply_r},{request_w}", REPORT_FD_ENV: str(report_fd),
+                   CHECK_DIR_ENV: str(check_dir), EDITABLE_ENV: json.dumps(task.editable)}
+            r = tester.run(command, check_dir, CHECK_TIMEOUT_S, cancel=cancel, env=env,
+                           pass_fds=(reply_r, request_w, report_fd))
+        finally:
+            stop_worker.set()
+            worker_thread.join()
+        report.seek(0)
+        raw = report.read(MAX_REPORT_BYTES)
     try:
-        data = json.loads(report.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(raw)
+    except ValueError:
         data = {}
-    finally:
-        report.unlink(missing_ok=True)
     return r, data if isinstance(data, dict) else {}
 
 
 def grade(
-    task: Task, ws: Path, check_dir: Path, runner: SandboxRunner, cancel: threading.Event | None = None,
+    task: Task, ws: Path, check_dir: Path, tester: SandboxRunner, worker: SandboxRunner,
+    cancel: threading.Event | None = None,
 ) -> Grade:
     """check_dir 的上级目录归评测框架用（放 pytest 配置），check_dir 本身还不能存在。"""
     shutil.copytree(task.repo, check_dir, symlinks=True)
-    r, collected = run_pytest(task, runner, check_dir, "--collect-only", cancel=cancel)
+    r, collected = run_pytest(task, check_dir, tester, worker, "--collect-only", cancel=cancel)
     if r.cancelled:
         return Grade(False, "判分被停止")
     expected = [t for t in collected.get("collected", []) if isinstance(t, str)]
     if not expected:
         raise RuntimeError(f"{task.id}：原题里收集不到测试，题目本身有问题")
     copy_editable(task, ws, check_dir)
-    r, rep = run_pytest(task, runner, check_dir, cancel=cancel)
+    r, rep = run_pytest(task, check_dir, tester, worker, cancel=cancel)
     if r.cancelled:
         return Grade(False, "判分被停止")
     if r.timed_out:
@@ -231,7 +275,10 @@ def run_task(
         check_root = Path(tempfile.mkdtemp(prefix=f"check-{task.id}-", dir=out_dir))
         try:
             check_dir = check_root / "repo"
-            result = grade(task, ws, check_dir, execution.make_runner(check_dir), cancel=cancel)
+            # 被测进程对整个 check_root 只读：测试文件、题目的 pytest 配置、评测框架写的空配置都改不了
+            worker = ExecutionPolicy(ApprovalMode.READ_ONLY, allow_network=False,
+                                     sandboxed=not no_sandbox).make_runner(check_root)
+            result = grade(task, ws, check_dir, execution.make_runner(check_dir), worker, cancel=cancel)
         finally:
             shutil.rmtree(check_root, ignore_errors=True)
 

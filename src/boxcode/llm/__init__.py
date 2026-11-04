@@ -1,5 +1,6 @@
 from boxcode.llm.base import (
     AssistantMessage,
+    LLMCancelled,
     LLMProvider,
     LLMResponse,
     LLMUnavailable,
@@ -15,6 +16,6 @@ from boxcode.llm.base import (
 )
 
 __all__ = [
-    "AssistantMessage", "LLMProvider", "LLMResponse", "LLMUnavailable", "Message", "Native", "StopReason",
-    "SystemMessage", "ToolCall", "ToolResultMessage", "ToolSpec", "Usage", "UserMessage",
+    "AssistantMessage", "LLMCancelled", "LLMProvider", "LLMResponse", "LLMUnavailable", "Message", "Native",
+    "StopReason", "SystemMessage", "ToolCall", "ToolResultMessage", "ToolSpec", "Usage", "UserMessage",
 ]

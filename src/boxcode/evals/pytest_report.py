@@ -1,20 +1,30 @@
-"""判分时用 `-p boxcode.evals.pytest_report` 加载的 pytest 插件：把收集到的测试和每个测试的结果
-写进环境变量 BOXCODE_REPORT 指向的 JSON 文件。
+"""判分时用 `-p boxcode.evals.pytest_report` 加载的 pytest 插件，在测试进程里：
 
-判分看这份报告，而不是只看退出码：Agent 写的代码在导入时 `os._exit(0)`，退出码是 0，但报告不会生成。
-它和被测代码在同一个进程里，专门针对它伪造报告的代码仍然防不住；完全防住要把测试和被测代码放进不同的进程。
+- 装上导入钩子：测试导入 editable 里的模块时，换成被测进程里的模块的代理（见 remote.py）。
+  被测代码不在这个进程里运行，改不了这里的数据、换不掉 pytest 的内部函数
+- 把收集到的测试和每个测试的结果写进 BOXCODE_REPORT_FD 这个文件描述符：它指向一个已经删掉的临时文件，
+  没有路径，被测进程（以及测试里起的子进程）都拿不到
+
+判分看这份报告，而不是只看退出码：被测代码在导入时 `os._exit(0)`，退出码是 0，但报告里那些测试没有通过。
 """
 
 import json
 import os
-from pathlib import Path
 from typing import Any
 
 import pytest
 
+from boxcode.evals.remote import REPORT_FD_ENV, install_from_env
+
 _collected: list[str] = []
 # 每个测试的结果：call 阶段通过记 "passed"；任何阶段没通过记 "<阶段>:<结果>"，例如 "setup:skipped"
 _outcomes: dict[str, str] = {}
+
+_report_fd: int | None = None
+if fd := os.environ.get(REPORT_FD_ENV):
+    _report_fd = int(fd)
+    os.set_inheritable(_report_fd, False)  # 测试里起的子进程（可能在跑被测代码）不继承它
+install_from_env()
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -29,8 +39,9 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    path = os.environ.get("BOXCODE_REPORT")
-    if not path:
+    if _report_fd is None:
         return
     data: dict[str, Any] = {"exitstatus": int(exitstatus), "collected": _collected, "outcomes": _outcomes}
-    Path(path).write_text(json.dumps(data), encoding="utf-8")
+    view = memoryview(json.dumps(data).encode())
+    while view:
+        view = view[os.write(_report_fd, view):]

@@ -1,10 +1,16 @@
-"""Claude 的格式转换。不发请求，只测转换和回复解析。"""
+"""Claude 的格式转换。不发请求，只测转换、回复解析和读流。"""
 
 import json
+import threading
+from collections.abc import Iterator
 from typing import Any
+
+import pytest
+from anthropic.types.beta import BetaMessage
 
 from boxcode.llm.base import (
     AssistantMessage,
+    LLMCancelled,
     Native,
     StopReason,
     SystemMessage,
@@ -13,7 +19,14 @@ from boxcode.llm.base import (
     Usage,
     UserMessage,
 )
-from boxcode.llm.claude import PROVIDER, convert_messages, convert_tools, parse_response, strip_before_fallback
+from boxcode.llm.claude import (
+    PROVIDER,
+    convert_messages,
+    convert_tools,
+    parse_response,
+    read_stream,
+    strip_before_fallback,
+)
 from boxcode.tools import default_tools
 
 Block = dict[str, Any]
@@ -85,3 +98,37 @@ def test_blocks_before_fallback_dropped() -> None:
     kept = strip_before_fallback(blocks)
     assert [b["type"] for b in kept] == ["text", "fallback", "text", "tool_use"]
     assert [c.id for c in parse_response(blocks, "tool_use", Usage()).tool_calls] == ["toolu_9"]
+
+
+class FakeStream:
+    """按顺序吐出事件；cancel_after 不是 None 时，吐出这么多个事件之后模拟用户按了停止。"""
+
+    def __init__(self, events: int, cancel: threading.Event, cancel_after: int | None = None) -> None:
+        self.events, self.cancel, self.cancel_after = events, cancel, cancel_after
+        self.read = 0
+
+    def __iter__(self) -> Iterator[object]:
+        for i in range(self.events):
+            if i == self.cancel_after:
+                self.cancel.set()
+            self.read += 1
+            yield {"type": "content_block_delta"}
+
+    def get_final_message(self) -> BetaMessage:
+        return BetaMessage.model_validate({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m", "content": [],
+            "stop_reason": "end_turn", "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+
+def test_stream_read_to_end_without_cancel() -> None:
+    stream = FakeStream(5, threading.Event())
+    assert read_stream(stream, stream.cancel).stop_reason == "end_turn" and stream.read == 5
+
+
+def test_stream_abandoned_as_soon_as_cancelled() -> None:
+    # 按停止后不再读剩下的事件：外面的 with 关掉连接，服务器停止生成，剩下的输出不再计费
+    stream = FakeStream(1000, threading.Event(), cancel_after=3)
+    with pytest.raises(LLMCancelled):
+        read_stream(stream, stream.cancel)
+    assert stream.read == 4

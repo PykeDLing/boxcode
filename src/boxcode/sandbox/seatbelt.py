@@ -10,6 +10,8 @@
   不能通过 LaunchServices 打开程序（`open` 起来的程序不在沙盒里）、不能发 Apple 事件、不能写别的程序的偏好设置、
   不能读写剪贴板、不能找钥匙串服务、不能给沙盒外的进程发信号
 - 网络：默认断网（连本机代理、域名解析一起挡），--allow-network 才放行
+- 进程：每条命令的规则里带一个独一无二的标记（procs.py），命令结束时按标记找出沙盒里剩下的进程全部杀掉，
+  用 setsid、setpgid 脱离了进程组的也跑不掉
 
 Seatbelt 按先后匹配，同一操作名后面的规则覆盖前面的。
 """
@@ -18,10 +20,11 @@ import shutil
 import tempfile
 import threading
 import weakref
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 from boxcode.paths import canonical
+from boxcode.sandbox.procs import marker_rule, new_marker
 from boxcode.sandbox.runner import CommandResult, run_process
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
@@ -153,7 +156,11 @@ class SeatbeltRunner:
 
     def run(
         self, command: str, cwd: Path, timeout_s: float, *,
-        cancel: threading.Event | None = None, env: Mapping[str, str] | None = None,
+        cancel: threading.Event | None = None, env: Mapping[str, str] | None = None, pass_fds: Sequence[int] = (),
     ) -> CommandResult:
-        argv = [SANDBOX_EXEC, "-p", self.profile, "/bin/sh", "-c", command]
-        return run_process(argv, cwd, timeout_s, cancel=cancel, env={"TMPDIR": f"{self.tmpdir}/", **(env or {})})
+        # 每条命令一个标记：命令结束时按它找出沙盒里剩下的进程（包括脱离了进程组的）全部杀掉，
+        # 同时在跑的别的命令（另一个 Agent、判分）有自己的标记，不会被误杀
+        marker = new_marker()
+        argv = [SANDBOX_EXEC, "-p", f"{self.profile}\n{marker_rule(marker)}\n", "/bin/sh", "-c", command]
+        return run_process(argv, cwd, timeout_s, cancel=cancel, env={"TMPDIR": f"{self.tmpdir}/", **(env or {})},
+                           sandbox_marker=marker, pass_fds=pass_fds)

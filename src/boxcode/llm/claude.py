@@ -9,18 +9,22 @@
 请求用流式（工具参数里可能有整个文件），工具开启 eager_input_streaming，参数边生成边传回。
 代价是服务器不再校验参数，所以：工具用 Pydantic 校验每个参数；撞上 max_tokens 的那一轮不执行工具；
 SDK 解析不了的 JSON 会在流里抛 ValueError，这时拿不到 tool_use_id，只能整个请求重发。
+
+流式还有一个好处：每收到一个事件都能看一眼 cancel，按了停止就断开连接（见 read_stream）。
 """
 
 import json
-from collections.abc import Sequence
-from typing import Any, cast
+import threading
+from collections.abc import Iterator, Sequence
+from typing import Any, Protocol, cast
 
 import anthropic
-from anthropic.types.beta import BetaOutputConfigParam
+from anthropic.types.beta import BetaMessage, BetaOutputConfigParam
 
 from boxcode.config import Settings
 from boxcode.llm.base import (
     AssistantMessage,
+    LLMCancelled,
     LLMResponse,
     LLMUnavailable,
     Message,
@@ -130,6 +134,22 @@ def parse_response(blocks: list[Block], stop_reason: str | None, usage: Usage) -
                        native=Native(PROVIDER, blocks))
 
 
+class _Stream(Protocol):
+    def __iter__(self) -> Iterator[object]: ...
+
+    def get_final_message(self) -> BetaMessage: ...
+
+
+def read_stream(stream: _Stream, cancel: threading.Event | None) -> BetaMessage:
+    """一个事件一个事件地读，每读一个看一眼 cancel：按了停止就抛 LLMCancelled，
+    外面的 with 随即关掉连接，服务器停止生成，剩下的输出不再计费。
+    生成过程中事件很密（思考、文字、工具参数的增量），长时间没有输出时服务器也会发 ping。"""
+    for _ in stream:
+        if cancel is not None and cancel.is_set():
+            raise LLMCancelled
+    return stream.get_final_message()
+
+
 class AnthropicProvider:
     def __init__(self, settings: Settings) -> None:
         self.name = settings.model
@@ -137,9 +157,13 @@ class AnthropicProvider:
         # 不传 api_key：SDK 依次找 ANTHROPIC_API_KEY、ANTHROPIC_AUTH_TOKEN、`ant auth login` 的配置
         self._client = anthropic.Anthropic()
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> LLMResponse:
+    def complete(
+        self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: threading.Event | None = None,
+    ) -> LLMResponse:
         system, msgs = convert_messages(messages)
         for attempt in range(JSON_RETRIES + 1):
+            if cancel is not None and cancel.is_set():
+                raise LLMCancelled
             try:
                 with self._client.beta.messages.stream(
                     model=self.name,
@@ -153,7 +177,7 @@ class AnthropicProvider:
                     betas=[FALLBACK_BETA],
                     fallbacks="default",
                 ) as stream:
-                    final = stream.get_final_message()
+                    final = read_stream(stream, cancel)
                 break
             except anthropic.AuthenticationError as e:
                 raise LLMUnavailable("Claude 鉴权失败：设置 ANTHROPIC_API_KEY，或运行 `ant auth login`") from e
