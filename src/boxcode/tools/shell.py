@@ -1,9 +1,14 @@
-from pydantic import BaseModel, Field
+from pydantic import Field
 
-from boxcode.tools.base import Risk, Target, Tool, ToolContext, ToolResult, truncate
+from boxcode.tools.base import Risk, Target, Tool, ToolContext, ToolParams, ToolResult
 
 
-class RunCommand(Tool):
+class RunCommandParams(ToolParams):
+    command: str = Field(min_length=1, description="Shell command, run with /bin/sh -c in the workspace root")
+    timeout_s: int = Field(default=60, ge=1, le=600, description="Kill the command after this many seconds")
+
+
+class RunCommand(Tool[RunCommandParams]):
     name = "run_command"
     description = (
         "Run a shell command in the workspace (the system prompt says what the sandbox allows). "
@@ -11,18 +16,18 @@ class RunCommand(Tool):
         "does not survive into the next call. Use it to run tests, linters and scripts."
     )
     risk = Risk.EXEC
+    Params = RunCommandParams
 
-    class Params(BaseModel):
-        command: str = Field(min_length=1)
-        timeout_s: int = Field(default=60, ge=1, le=600)
-
-    def target(self, ctx: ToolContext, params: BaseModel) -> Target:
-        assert isinstance(params, RunCommand.Params)
+    def target(self, ctx: ToolContext, params: RunCommandParams) -> Target:
         return Target(command=params.command)
 
-    def run(self, ctx: ToolContext, params: Params) -> ToolResult:
+    def run(self, ctx: ToolContext, params: RunCommandParams) -> ToolResult:
         timeout = min(params.timeout_s, ctx.settings.command_timeout_s)
-        r = ctx.runner.run(params.command, ctx.workspace, timeout)
-        head = "超时，已结束" if r.timed_out else f"exit code: {r.exit_code}"
-        body = f"{head}\n--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}"
-        return ToolResult(truncate(body, ctx.settings.max_tool_output), ok=r.exit_code == 0 and not r.timed_out)
+        r = ctx.runner.run(params.command, ctx.workspace, timeout, cancel=ctx.cancel)
+        if r.cancelled:
+            head = "已被用户停止"
+        elif r.timed_out:
+            head = f"超过 {timeout} 秒，已结束"
+        else:
+            head = f"exit code: {r.exit_code}"
+        return ToolResult(f"{head}\n--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}", ok=r.ok)

@@ -1,5 +1,6 @@
 category = "feature"
 id = "002-implement-slugify"
 prompt = "Implement slugify() in text_utils.py so that tests/test_text_utils.py passes."
-check = "{python} -m pytest -q"
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["text_utils.py"]
 verify = "python -m pytest -q"

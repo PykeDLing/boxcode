@@ -1,5 +1,6 @@
 category = "bugfix"
 id = "001-fix-moving-average"
 prompt = "tests/test_stats.py is failing. Find the bug in stats.py and fix it without changing the tests."
-check = "{python} -m pytest -q"
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["stats.py"]
 verify = "python -m pytest -q"

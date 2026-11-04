@@ -345,6 +345,9 @@ textarea.input { resize: vertical; line-height: 1.5; }
 .approval-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .approval-reason { color: var(--ink-2); }
 .approval .actions { margin-top: 10px; }
+/* 要确认的命令整段显示：不能让几十个空行把真正的内容藏到滚动区外面 */
+.approval .pre { max-height: none; }
+.approval-meta { margin-top: 6px; color: var(--ink-3); font-size: 12px; }
 
 /* ---- 时间线 ---- */
 

@@ -16,6 +16,7 @@ const STATUS = {
   max_turns: { label: "超出轮数", tone: "warning", icon: "!" },
   refused: { label: "模型拒绝", tone: "warning", icon: "!" },
   error: { label: "出错", tone: "critical", icon: "✕" },
+  cancelled: { label: "已停止", tone: "muted", icon: "■" },
   crashed: { label: "崩溃", tone: "critical", icon: "✕" },
   unfinished: { label: "未结束", tone: "muted", icon: "○" },
 };
@@ -29,7 +30,18 @@ const DECISION = {
 // ---- 小工具 ----
 
 const $ = (id) => document.getElementById(id);
-const api = () => window.pywebview.api;
+// 每次调用接口都带上本次窗口的 token：窗口被导航到别的页面时，那个页面拿不到它（见 gui/api.py）
+const TOKEN = document.currentScript.dataset.token;
+const API = new Proxy({}, { get: (_, name) => (...args) => window.pywebview.api[name](TOKEN, ...args) });
+const api = () => API;
+// 只认对象自己的键：页面上显示的状态名来自轨迹文件，可能是 "constructor" 这种名字
+const lookup = (table, key) => (Object.hasOwn(table, key) ? table[key] : undefined);
+// 要确认的命令里，控制字符、零宽字符、双向文字控制符都显示成 ⟨U+XXXX⟩，不能用它们把内容藏起来
+const INVISIBLE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
+const revealInvisible = (text) =>
+  text.replace(INVISIBLE, (c) => `⟨U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")}⟩`);
+// 确认卡片出现后，按钮过这么久才能点：连点“放行”不会把紧跟着的下一条命令也放行了
+const APPROVAL_ARM_MS = 700;
 
 function h(tag, props, ...children) {
   const el = document.createElement(tag);
@@ -75,7 +87,7 @@ function reportTime(id) {
 }
 
 function badge(key) {
-  const s = STATUS[key] || STATUS.unfinished;
+  const s = lookup(STATUS, key) || STATUS.unfinished;
   return h("span", { class: `badge tone-${s.tone}` }, h("span", { class: "badge-icon", "aria-hidden": "true", text: s.icon }), s.label);
 }
 
@@ -167,7 +179,7 @@ function timelineItem(e, t0) {
   switch (e.event) {
     case "run_start":
       title = [h("strong", { text: "开始运行" })];
-      meta.push([e.model, MODE_LABELS[e.mode] || e.mode, `沙盒 ${e.sandbox === "seatbelt" ? "Seatbelt" : "未启用"}`,
+      meta.push([e.model, lookup(MODE_LABELS, e.mode) || e.mode, `沙盒 ${e.sandbox === "seatbelt" ? "Seatbelt" : "未启用"}`,
         `网络${e.allow_network ? "开" : "关"}`].join(" · "));
       break;
     case "llm_call": {
@@ -183,7 +195,7 @@ function timelineItem(e, t0) {
     case "tool_call": {
       dot = "ink";
       const args = parseArgs(e.arguments);
-      const d = DECISION[e.decision] || DECISION.invalid;
+      const d = lookup(DECISION, e.decision) || DECISION.invalid;
       title = [
         h("code", { class: "tool-name", text: e.tool }),
         h("span", { class: "tool-target mono", text: toolTarget(e.tool, args), title: toolTarget(e.tool, args) }),
@@ -207,7 +219,7 @@ function timelineItem(e, t0) {
       meta.push(e.error || "");
       break;
     case "run_end": {
-      const s = STATUS[e.status] || STATUS.unfinished;
+      const s = lookup(STATUS, e.status) || STATUS.unfinished;
       dot = s.tone === "accent" || s.tone === "muted" ? "" : s.tone;
       title = [h("strong", { text: "结束" }), badge(e.status)];
       meta.push(`调用模型 ${e.turns ?? "—"} 次 · 修正 ${e.fix_rounds ?? 0} 轮`);
@@ -275,7 +287,7 @@ class RunView {
 
     const meta = [];
     if (start) {
-      meta.push(h("span", { text: start.model }), h("span", { text: MODE_LABELS[start.mode] || start.mode }));
+      meta.push(h("span", { text: start.model }), h("span", { text: lookup(MODE_LABELS, start.mode) || start.mode }));
       meta.push(h("span", { text: `沙盒 ${start.sandbox === "seatbelt" ? "Seatbelt" : "未启用"} · 网络${start.allow_network ? "开" : "关"}` }));
       meta.push(h("span", { class: "mono", text: start.workspace, title: start.workspace }));
       meta.push(h("span", { text: fmtTime(start.ts) }));
@@ -354,10 +366,13 @@ const handlers = {
     state.stopping = false;
     state.runsLoaded = false; // 历史列表里多了一条
     liveView.stopLive();
+    // “开始”和“停止”在同一个位置：刚停下来时多点的那一下不能把任务又开起来
+    $("f-start").disabled = true;
+    setTimeout(() => { $("f-start").disabled = false; }, 1000);
     updateRunControls();
     updateNav();
     if (state.view !== "run") {
-      const s = STATUS[msg.status] || STATUS.unfinished;
+      const s = lookup(STATUS, msg.status) || STATUS.unfinished;
       toast(`任务结束：${s.label}`);
     }
   },
@@ -369,13 +384,14 @@ const handlers = {
   },
   async eval_finished(msg) {
     state.evalRunning = false;
+    // 先清掉再 await：等待期间新开的一轮评测不能被这里清掉
+    if (state.evalLive && state.evalLive.reportId === msg.report_id) state.evalLive = null;
     updateEvalControls();
     updateNav();
     if (msg.error) toast(`评测出错：${msg.error}`);
-    else if (state.view !== "eval") toast("评测结束");
+    else if (state.view !== "eval") toast(msg.stopped ? "评测已停止" : "评测结束");
     await loadReports();
     if (state.selectedReport === msg.report_id) await selectReport(msg.report_id, { keepTask: true });
-    state.evalLive = null;
   },
 };
 
@@ -482,20 +498,27 @@ async function stopRun() {
 
 function approvalCard(msg) {
   const params = msg.params || {};
-  const body = msg.tool === "run_command" ? params.command : JSON.stringify(params, null, 2);
-  const answer = (approved) => {
+  const body = String(msg.tool === "run_command" ? params.command : JSON.stringify(params, null, 2));
+  const lines = body.split("\n").length;
+  const answer = (event, approved) => {
+    if (event.detail > 1) return; // 双击、三击：不是看过之后点的
     card.querySelectorAll("button").forEach((b) => { b.disabled = true; });
     api().answer_approval(msg.id, approved).catch(showError);
   };
-  const card = h("div", { class: "approval" },
+  const buttons = [
+    h("button", { type: "button", class: "btn primary small", text: "放行这一次", disabled: true, onclick: (e) => answer(e, true) }),
+    h("button", { type: "button", class: "btn small", text: "拒绝", disabled: true, onclick: (e) => answer(e, false) }),
+  ];
+  const card = h("div", { class: "approval", role: "alertdialog", "aria-label": `需要确认：${msg.reason}`, tabindex: "-1" },
     h("div", { class: "approval-head" },
       h("span", { class: "badge tone-warning" }, h("span", { class: "badge-icon", "aria-hidden": "true", text: "!" }), "需要确认"),
       h("span", { class: "approval-reason", text: msg.reason }),
       h("code", { class: "tool-name", text: msg.tool })),
-    pre(body),
-    h("div", { class: "actions" },
-      h("button", { type: "button", class: "btn primary small", text: "放行这一次", onclick: () => answer(true) }),
-      h("button", { type: "button", class: "btn small", text: "拒绝", onclick: () => answer(false) })));
+    pre(revealInvisible(body)),
+    h("div", { class: "approval-meta", text: `${lines} 行，${body.length} 个字符` }),
+    h("div", { class: "actions" }, ...buttons));
+  setTimeout(() => buttons.forEach((b) => { b.disabled = false; }), APPROVAL_ARM_MS);
+  setTimeout(() => card.focus(), 0);
   return card;
 }
 
@@ -522,7 +545,7 @@ function renderRunList() {
     return;
   }
   $("h-list").replaceChildren(...runs.map((r) => {
-    const meta = [r.model, MODE_LABELS[r.mode] || r.mode, r.summary ? `${r.summary.llm_calls} 次模型调用` : null].filter(Boolean).join(" · ");
+    const meta = [r.model, lookup(MODE_LABELS, r.mode) || r.mode, r.summary ? `${r.summary.llm_calls} 次模型调用` : null].filter(Boolean).join(" · ");
     return h("li", null, h("button", {
       type: "button",
       class: `run-item${r.run_id === state.selectedRun ? " selected" : ""}`,
@@ -538,6 +561,7 @@ async function selectRun(runId) {
   state.selectedRun = runId;
   renderRunList();
   const events = await api().load_run(runId);
+  if (state.selectedRun !== runId) return; // 等待期间又点了别的
   historyView.load(events);
   $("h-pane").replaceChildren(historyView.el);
   $("h-pane").scrollTop = 0;
@@ -579,7 +603,7 @@ function renderTasks() {
         box,
         h("div", { class: "task-item-top" },
           h("span", { class: "mono task-item-id", text: t.id, title: t.id }),
-          chip(CATEGORY[t.category] || t.category, t.category === "injection" ? "warning" : "muted")),
+          chip(lookup(CATEGORY, t.category) || t.category, t.category === "injection" ? "warning" : "muted")),
         h("div", { class: "task-item-prompt", text: t.prompt, title: t.prompt })));
     }));
   }
@@ -617,7 +641,9 @@ async function selectReport(reportId, { keepTask = false } = {}) {
   state.selectedReport = reportId;
   if (!keepTask) state.selectedEvalTask = null;
   const live = state.evalLive && state.evalLive.reportId === reportId && state.evalRunning;
-  state.reportData = live ? null : await api().load_report(reportId);
+  const data = live ? null : await api().load_report(reportId);
+  if (state.selectedReport !== reportId) return; // 等待期间又点了别的
+  state.reportData = data;
   renderReports();
   renderReport();
   if (state.selectedEvalTask) await showEvalTrace(state.selectedEvalTask);
@@ -699,7 +725,7 @@ function renderReport() {
     if (row.state === "running") resultCell = badge("running");
     else if (!r) resultCell = h("span", { class: "status-text", text: "等待" });
     else {
-      resultCell = h("span", { class: "cell-badges" },
+      resultCell = h("span", { class: "cell-badges", title: r.check_detail || null },
         h("span", { class: `badge tone-${r.passed ? "good" : "critical"}` },
           h("span", { class: "badge-icon", "aria-hidden": "true", text: r.passed ? "✓" : "✕" }), r.passed ? "通过" : "未通过"),
         r.category === "injection" ? chip(r.induced ? "被诱导" : "未被诱导", r.induced ? "critical" : "muted") : null);
@@ -710,9 +736,9 @@ function renderReport() {
       onclick: clickable ? () => { state.selectedEvalTask = row.id; renderReport(); showEvalTrace(row.id).catch(showError); } : null,
     },
     h("td", { class: "col-id mono", text: row.id, title: row.id }),
-    h("td", { text: CATEGORY[row.category] || row.category || "" }),
+    h("td", { text: lookup(CATEGORY, row.category) || row.category || "" }),
     h("td", null, resultCell),
-    h("td", { class: "status-text", text: r ? (STATUS[r.agent_status] || { label: r.agent_status }).label : "" }),
+    h("td", { class: "status-text", text: r ? (lookup(STATUS, r.agent_status) || { label: r.agent_status }).label : "" }),
     h("td", { class: "num", text: r ? fmtSec(r.seconds) : "" }),
     h("td", { class: "num", text: r ? fmtInt(r.summary.llm_calls) : "" }),
     h("td", { class: "num", text: r ? fmtInt(r.summary.prompt_tokens + r.summary.completion_tokens) : "" }));
@@ -741,6 +767,8 @@ async function showEvalTrace(taskId) {
 // ---- 启动 ----
 
 async function init() {
+  // 拖进窗口的文件或链接会被直接打开，那个页面不受这里的 CSP 管：一律拦掉
+  for (const type of ["dragover", "drop"]) window.addEventListener(type, (e) => e.preventDefault());
   liveView = new RunView($("run-pane"));
   liveView.el.hidden = true;
   $("run-pane").append(liveView.el);
