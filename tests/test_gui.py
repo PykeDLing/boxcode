@@ -3,13 +3,15 @@
 import json
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from boxcode.config import Settings
-from boxcode.gui.api import GuiApi
+from boxcode.gui import api as gui_api
+from boxcode.gui.api import EXPOSED, GuiApi, bridge_functions
 from boxcode.gui.app import page_html
 from boxcode.llm.base import LLMProvider, LLMResponse, LLMUnavailable
 from boxcode.llm.scripted import ScriptedProvider, call
@@ -47,8 +49,9 @@ def make_api(settings: Settings, tmp_path: Path, page: Page, script: list[LLMRes
 
 
 def test_page_html_inlines_assets_with_fresh_nonce() -> None:
-    html = page_html()
+    html = page_html("tok-123")
     assert "{{" not in html and "/*{{" not in html
+    assert 'data-token="tok-123"' in html and "base-uri 'none'" in html and "form-action 'none'" in html
     nonces = set(re.findall(r"nonce-([\w-]+)'", html)) | set(re.findall(r'<script nonce="([\w-]+)"', html))
     assert len(nonces) == 1  # CSP 和脚本标签用的是同一个
     assert "default-src 'none'" in html and "window.boxcode" in html and "--accent" in html
@@ -159,7 +162,7 @@ def test_stop_denies_pending_approval_and_ends_run(settings: Settings, tmp_path:
 
     assert page.of("approval_resolved")[0]["approved"] is False
     finished = page.of("run_finished")[0]
-    assert finished["status"] == "error" and "停止" in finished["final_message"]
+    assert finished["status"] == "cancelled" and "停止" in finished["final_message"]
     # 线程已经结束、没有卡在等待上：马上能开下一次
     page.finished.clear()
     assert api.start_run({"task": "again", "workspace": str(workspace)})["ok"]
@@ -193,6 +196,7 @@ def test_reports_and_eval_traces(settings: Settings, tmp_path: Path) -> None:
     trace = TraceRecorder(report_dir / "runs")
     trace.emit("run_start", task="t")
     # 报告里的路径是相对评测时的当前目录，不一定能直接打开
+    assert trace.path is not None
     trace_path = f"evals/results/whatever/runs/{trace.path.name}"
     report = {"model": "m", "tasks": 1, "pass_rate": 1.0, "injection_induced_rate": None, "avg_llm_calls": 1.0,
               "total_tokens": 10, "results": [{"id": "001-x", "trace_path": trace_path}]}
@@ -227,3 +231,49 @@ def test_eval_reports_progress(settings: Settings, tmp_path: Path) -> None:
     assert api.list_reports()[0]["id"] == res["report_id"]
     events = api.load_eval_trace(res["report_id"], "001-fix-moving-average")
     assert events[0]["event"] == "run_start" and events[-1]["event"] == "run_end"
+
+
+def test_bridge_requires_token_and_hides_internals(settings: Settings, tmp_path: Path) -> None:
+    # pywebview 按点号路径逐级 getattr：把 GuiApi 整个交出去，页面就能调 _resolve_all、_settings.home.parent.chmod
+    api = make_api(settings, tmp_path, Page())
+    funcs = {f.__name__: f for f in bridge_functions(api, "secret-token")}
+    assert set(funcs) == set(EXPOSED) and not any(name.startswith("_") for name in funcs)
+    assert funcs["list_tasks"]("secret-token")[0]["id"] == "001-fix-moving-average"
+    # 窗口被导航到别的页面时，那个页面也拿得到接口，但没有 token
+    for bad in ("wrong", None, ["secret-token"]):
+        with pytest.raises(PermissionError):
+            funcs["start_run"](bad, {"task": "x", "workspace": "/"})
+    assert all(hasattr(api, name) and callable(getattr(api, name)) for name in EXPOSED)
+
+
+def test_page_cannot_smuggle_approval(settings: Settings, tmp_path: Path) -> None:
+    api = make_api(settings, tmp_path, Page())
+    approval = gui_api._Approval()
+    api._approvals["r1"] = approval
+    api.answer_approval("r1", "false")  # type: ignore[arg-type]  # JSON 里来的字符串不能当成同意
+    assert approval.done.is_set() and approval.approved is False
+    assert api.start_eval("001")["error"].startswith("参数不对")  # type: ignore[arg-type]
+
+
+def test_start_run_refuses_unsafe_workspace(settings: Settings, tmp_path: Path) -> None:
+    res = make_api(settings, tmp_path, Page(), [LLMResponse("ok")]).start_run(
+        {"task": "x", "workspace": str(Path.home())})
+    assert not res["ok"] and "主目录" in res["error"]
+
+
+@macos_only
+def test_shutdown_waits_for_run_end(settings: Settings, tmp_path: Path, workspace: Path) -> None:
+    # 关窗口时正在执行的命令要被杀掉，轨迹里要有 run_end；以前进程直接退出，历史里一直显示“未结束”
+    page = Page()
+    api = make_api(settings, tmp_path, page, [LLMResponse(None, [call("run_command", command="sleep 30")])])
+    res = api.start_run({"task": "x", "workspace": str(workspace), "mode": "full-auto"})
+    assert res["ok"]
+    deadline = time.monotonic() + WAIT_S
+    while not any(d["event"]["event"] == "llm_call" for d in page.of("trace")) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    t0 = time.monotonic()
+    api.shutdown()
+    assert time.monotonic() - t0 < 5
+    events = api.load_run(res["run_id"])
+    assert events[-1]["event"] == "run_end" and events[-1]["status"] == "cancelled"
+    assert not page.of("run_finished")  # 窗口已经关了，不再往页面推

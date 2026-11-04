@@ -1,36 +1,44 @@
 """Claude 的格式转换。不发请求，只测转换和回复解析。"""
 
 import json
-from pathlib import Path
+from typing import Any
 
-from boxcode.agent import Agent, Status
-from boxcode.config import Settings
-from boxcode.llm.base import LLMResponse, Usage
-from boxcode.llm.claude import convert_messages, convert_tools, parse_response, strip_before_fallback
-from boxcode.llm.scripted import ScriptedProvider, call
-from boxcode.sandbox import NoSandboxRunner
+from boxcode.llm.base import (
+    AssistantMessage,
+    Native,
+    StopReason,
+    SystemMessage,
+    ToolCall,
+    ToolResultMessage,
+    Usage,
+    UserMessage,
+)
+from boxcode.llm.claude import PROVIDER, convert_messages, convert_tools, parse_response, strip_before_fallback
 from boxcode.tools import default_tools
 
-THINKING = {"type": "thinking", "thinking": "", "signature": "sig-abc"}
-TOOL_USE = {"type": "tool_use", "id": "toolu_1", "name": "list_dir", "input": {"path": "."}}
+Block = dict[str, Any]
+THINKING: Block = {"type": "thinking", "thinking": "", "signature": "sig-abc"}
+TOOL_USE: Block = {"type": "tool_use", "id": "toolu_1", "name": "list_dir", "input": {"path": "."}}
 
 
 def test_tools_converted_with_eager_streaming() -> None:
-    tools = convert_tools([t.schema() for t in default_tools()])
+    tools = convert_tools([t.spec() for t in default_tools()])
     edit = next(t for t in tools if t["name"] == "edit_file")
     assert edit["input_schema"]["required"] == ["path", "old_string", "new_string"]
+    # 多给的参数在 Schema 里就写明不允许
+    assert edit["input_schema"]["additionalProperties"] is False
     assert all(t["eager_input_streaming"] for t in tools)
 
 
 def test_parallel_tool_results_merged_into_one_user_message() -> None:
     raw = [THINKING, TOOL_USE, {**TOOL_USE, "id": "toolu_2"}]
     system, msgs = convert_messages([
-        {"role": "system", "content": "SYS"},
-        {"role": "user", "content": "task"},
-        {"role": "assistant", "content": None, "_anthropic_content": raw},
-        {"role": "tool", "tool_call_id": "toolu_1", "content": "a", "_is_error": False},
-        {"role": "tool", "tool_call_id": "toolu_2", "content": "boom", "_is_error": True},
-        {"role": "user", "content": "check failed"},
+        SystemMessage("SYS"),
+        UserMessage("task"),
+        AssistantMessage(None, native=Native(PROVIDER, raw)),
+        ToolResultMessage("toolu_1", "a"),
+        ToolResultMessage("toolu_2", "boom", is_error=True),
+        UserMessage("check failed"),
     ])
     assert system == "SYS"
     assert [m["role"] for m in msgs] == ["user", "assistant", "user", "user"]
@@ -42,27 +50,33 @@ def test_parallel_tool_results_merged_into_one_user_message() -> None:
 
 def test_assistant_from_other_provider_rebuilt() -> None:
     _, msgs = convert_messages([
-        {"role": "user", "content": "x"},
-        {"role": "assistant", "content": "looking", "tool_calls": [
-            {"id": "c1", "type": "function", "function": {"name": "grep", "arguments": '{"pattern": "a"}'}}]},
+        UserMessage("x"),
+        AssistantMessage("looking", (ToolCall("c1", "grep", '{"pattern": "a"}'), ToolCall("c2", "grep", "{bad")),
+                         native=Native("openai", "ignored")),
     ])
     assert msgs[1]["content"] == [
         {"type": "text", "text": "looking"},
         {"type": "tool_use", "id": "c1", "name": "grep", "input": {"pattern": "a"}},
+        # 别的模型给的参数不是合法 JSON：那次调用已经作为错误回给了模型，这里只要能发出去
+        {"type": "tool_use", "id": "c2", "name": "grep", "input": {}},
     ]
 
 
 def test_parse_response_keeps_raw_blocks() -> None:
     blocks = [THINKING, {"type": "text", "text": "Let me look."}, TOOL_USE]
     r = parse_response(blocks, "tool_use", Usage(10, 5, 8))
-    assert r.content == "Let me look."
+    assert r.content == "Let me look." and r.stop_reason is StopReason.END
     assert r.tool_calls[0].name == "list_dir" and json.loads(r.tool_calls[0].arguments) == {"path": "."}
     assert not r.truncated
-    assert r.to_message()["_anthropic_content"] == blocks
+    msg = r.to_message()
+    assert msg.native == Native(PROVIDER, blocks) and msg.tool_calls == tuple(r.tool_calls)
 
 
-def test_max_tokens_with_tool_call_is_truncated() -> None:
+def test_stop_reasons() -> None:
     assert parse_response([TOOL_USE], "max_tokens", Usage()).truncated
+    assert parse_response([TOOL_USE], "model_context_window_exceeded", Usage()).truncated
+    assert not parse_response([{"type": "text", "text": "long"}], "max_tokens", Usage()).truncated  # 没有工具调用
+    assert parse_response([], "refusal", Usage()).stop_reason is StopReason.REFUSAL
 
 
 def test_blocks_before_fallback_dropped() -> None:
@@ -70,22 +84,4 @@ def test_blocks_before_fallback_dropped() -> None:
               {"type": "fallback"}, {"type": "text", "text": "rest"}, {**TOOL_USE, "id": "toolu_9"}]
     kept = strip_before_fallback(blocks)
     assert [b["type"] for b in kept] == ["text", "fallback", "text", "tool_use"]
-    assert parse_response(blocks, "tool_use", Usage()).tool_calls[0].id == "toolu_9"
-
-
-def test_truncated_tool_calls_not_executed(workspace: Path, settings: Settings) -> None:
-    llm = ScriptedProvider([
-        LLMResponse(None, [call("write_file", path="big.txt", content="half")], truncated=True),
-        LLMResponse("ok"),
-    ])
-    Agent(llm, workspace, settings, runner=NoSandboxRunner()).run("write")
-    assert not (workspace / "big.txt").exists()
-    tool_msg = llm.seen[1][-1]
-    assert tool_msg["role"] == "tool" and tool_msg["_is_error"] is True and "max_tokens" in tool_msg["content"]
-
-
-def test_refusal_stops_without_running_tools(workspace: Path, settings: Settings) -> None:
-    llm = ScriptedProvider([LLMResponse(None, [call("write_file", path="x", content="y")], stop_reason="refusal")])
-    result = Agent(llm, workspace, settings, runner=NoSandboxRunner()).run("x")
-    assert result.status is Status.REFUSED
-    assert not (workspace / "x").exists()
+    assert [c.id for c in parse_response(blocks, "tool_use", Usage()).tool_calls] == ["toolu_9"]

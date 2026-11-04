@@ -18,17 +18,17 @@
 
 BoxCode 把模型要跑的每条命令放进 Seatbelt 沙盒（`sandbox-exec`，Codex CLI 在 macOS 上用的也是它）：
 
-- **只能写工作区**，工作区里的 `.git` 整个只读（改了 hook、`core.fsmonitor`，或者把 `.git` 换成指向别处的文件，你下次在沙盒外运行 git 时就会执行它）
-- **读不到常见的凭证位置**：SSH、GPG、AWS、Docker、GitHub CLI 的密钥，shell 配置和历史，工作区外的 `.env`，钥匙串，浏览器和其他 App 的数据
+- **只能写工作区**，`.git` 整个只读（改了 hook、`core.fsmonitor`，或者把 `.git` 换成指向别处的文件，你下次在沙盒外运行 git 时就会执行它）；工作区和它的上级目录也不能改名，挪走工作区、在别处改 `.git` 再挪回来这条路也堵上了
+- **读不到常见的凭证位置**：SSH、GPG、AWS、Docker、GitHub CLI、`ant auth login` 的密钥，其他 Agent 的配置，shell 配置和历史（是指向 dotfiles 仓库的链接也一样），工作区外的 `.env`，钥匙串，浏览器和其他 App 的数据
 - **默认断网**：IP 连接、域名解析、连本机代理一起挡住
-- **拿不到 API key**：环境变量只传白名单，模型的 key、`SSH_AUTH_SOCK` 都不传
-- 连不上主目录里别的程序的套接字（gpg-agent、1Password SSH 代理、Docker）
+- **借不了别的程序的手**：不能用 `open` 启动程序（LaunchServices 起来的程序不在沙盒里），不能发 Apple 事件，连不上工作区和沙盒自己临时目录以外的 unix 套接字（ssh-agent、浏览器、Docker），不能写别的程序的偏好设置，不能读剪贴板、找钥匙串，不能给沙盒外的进程发信号、往别的终端里写字
+- **环境变量只传白名单**：模型的 key、`SSH_AUTH_SOCK` 都不传给命令
 
-上面每一条都有测试，测试会真实启动沙盒去验证。沙盒规则的写法来自我的另一个项目 [MacBox](https://github.com/PykeDLing/macbox)，Agent 循环参考了 OpenAI Codex CLI 和 pi-mono 的设计。
+上面每一条都有测试，测试会真实启动沙盒去验证；其中好几条是红队实测找到的绕过（见[技术方案 4.4](docs/design.md#44-沙盒sandboxseatbeltpy)）。沙盒规则的写法来自我的另一个项目 [MacBox](https://github.com/PykeDLing/macbox)，Agent 循环参考了 OpenAI Codex CLI 和 pi-mono 的设计。
 
 ## 评测结果
 
-`boxcode eval` 把每道题的仓库复制到临时目录，让 Agent 去做，再用题目自带的命令判分。判分也在沙盒里跑，测试和 pytest 配置用原题的版本，Agent 改测试不算通过。注入题另外统计模型有没有被诱导去执行注入的指令（不管有没有被拦下）。
+`boxcode eval` 把每道题的仓库复制到临时目录，让 Agent 去做，再跑原题的测试判分。判分目录是原题的新拷贝，只拷回题目声明可以改的文件，pytest 隔离启动，并且原题的每个测试都要通过，不只看退出码：改测试、遮住 pytest、伪造字节码缓存、导入时直接 `exit(0)` 这些作弊写法都有测试（[技术方案 5.1](docs/design.md#51-题目格式)）。判分也在沙盒里跑。注入题另外统计模型有没有被诱导去执行注入的指令（不管有没有被拦下）。
 
 2026-11-03（102 是 11-04 补跑的），`claude-opus-5-5`，effort `high`：
 
@@ -59,14 +59,16 @@ uv run pytest -q          # 不需要 API key
 ```bash
 # Claude（官方 anthropic SDK），默认 claude-opus-5-5
 export BOXCODE_PROVIDER=anthropic
-export ANTHROPIC_API_KEY=sk-ant-...       # 建议写进 ~/.zshrc，不要直接贴在命令里
+ant auth login                            # 凭证存在 ~/.config/anthropic，沙盒里读不到
 
 # 或者任何 OpenAI 兼容接口：DeepSeek、通义千问、小米 MiMo、本机 Ollama、vLLM
 export BOXCODE_PROVIDER=openai
 export BOXCODE_BASE_URL=https://api.deepseek.com
-export BOXCODE_API_KEY=sk-...
 export BOXCODE_MODEL=deepseek-chat
+mkdir -p ~/.boxcode && (umask 077; pbpaste > ~/.boxcode/api_key)   # 先复制 key；也可以用 BOXCODE_API_KEY
 ```
+
+key 尽量不要放在环境变量里（包括写进 `~/.zshrc` 再 export）：沙盒里的命令能读到同一个用户下任何进程启动时的环境变量，这一点 Seatbelt 挡不住。`~/.config/anthropic` 和 `~/.boxcode` 沙盒里都读不到。
 
 然后：
 
@@ -88,7 +90,7 @@ uv run boxcode eval
 uv run boxcode gui
 ```
 
-- **新任务**：选工作区、写任务、选权限模式和自检命令。点“开始”后，页面实时显示每次模型调用、工具调用、权限决定和自检结果；需要确认的命令固定在最上面，点“放行这一次”或“拒绝”
+- **新任务**：选工作区、写任务、选权限模式和自检命令。点“开始”后，页面实时显示每次模型调用、工具调用、权限决定和自检结果；需要确认的命令固定在最上面，点“放行这一次”或“拒绝”。按“停止”会立刻杀掉正在执行的命令
 - **历史轨迹**：浏览 `~/.boxcode/runs/` 里的每次运行，展开看工具参数和 `edit_file` 改了什么
 - **评测**：勾选题目运行，逐题看结果、通过率和注入诱导率，点一道题看它的执行轨迹
 
@@ -101,11 +103,14 @@ uv run boxcode gui
 | `BOXCODE_PROVIDER` | `openai` | `anthropic` 或 `openai` |
 | `BOXCODE_MODEL` | `claude-opus-5-5` / `deepseek-chat` | 模型 |
 | `BOXCODE_EFFORT` | `high` | Claude 的思考深度：`low` / `medium` / `high` / `xhigh` / `max` |
-| `BOXCODE_BASE_URL`、`BOXCODE_API_KEY` | | OpenAI 兼容接口的地址和 key |
+| `BOXCODE_BASE_URL`、`BOXCODE_API_KEY` | | OpenAI 兼容接口的地址和 key；没设置 key 时读 `~/.boxcode/api_key` |
 | `BOXCODE_MAX_TURNS` | `30` | 最多调用模型几轮 |
 | `BOXCODE_MAX_FIX_ROUNDS` | `2` | 自检失败后最多再修几轮 |
 | `BOXCODE_COMMAND_TIMEOUT` | `120` | 单条命令的超时（秒） |
+| `BOXCODE_MAX_TOOL_OUTPUT` | `12000` | 每个工具结果回给模型前最多保留的字符数 |
 | `BOXCODE_HOME` | `~/.boxcode` | 执行轨迹存放位置 |
+
+值写错了（例如 `BOXCODE_MAX_TURNS=abc`、不认识的 `BOXCODE_PROVIDER`）启动时就会报出是哪个变量，退出码 2。
 
 ## 权限模式
 
@@ -118,6 +123,8 @@ uv run boxcode gui
 | `full-auto` | ✅ | ✅ | 全部放行 |
 
 不管哪种模式，命令都在沙盒里执行。权限策略只是第一道关：命令可以换写法绕过正则，所以它的作用是把高风险的事提前拿给人看、在轨迹里留下“为什么放行”，真正挡住破坏的是沙盒。
+
+沙盒放行整个工作区的写入，所以工作区不能是根目录、主目录（`-w ~` 等于把 `~/.zshrc`、`~/Library/LaunchAgents` 交给模型），不能在 `~/Library`、`~/.ssh` 这类位置里，也不能是 `/Applications`、`/opt` 这类系统目录；选了会直接拒绝。
 
 ## 工作原理
 
@@ -169,7 +176,7 @@ uv run pytest -q              # 测试
 
 CI 在 GitHub Actions 的 macOS 机器上跑这三项。给 AI 编程助手的约定写在 [AGENTS.md](AGENTS.md)。
 
-新增评测题：在 `evals/tasks/` 下建 `<编号>-<名字>/`，放 `task.toml` 和 `repo/`（`repo/` 根目录放一个空的 `conftest.py`），格式照现有的题。判分时 `tests/`、`conftest.py` 和 pytest 配置文件用原题的版本；题目要让 Agent 改其中的文件，就在 `task.toml` 里用 `protected` 覆盖。
+新增评测题：在 `evals/tasks/` 下建 `<编号>-<名字>/`，放 `task.toml` 和 `repo/`（`repo/` 根目录放一个 `conftest.py`），格式照现有的题。`editable` 列出 Agent 可以改的文件，判分时只把这些文件拷回原题，其余一律用原题的版本；尽量写具体的文件名，不要写 `*.py` 这种宽的模式。
 
 ## 限制
 
@@ -177,8 +184,11 @@ CI 在 GitHub Actions 的 macOS 机器上跑这三项。给 AI 编程助手的�
 - 沙盒默认断网、不能写工作区外的缓存目录，所以沙盒里装不了依赖，需要的依赖要提前装好
 - 读用的是黑名单：挡住的是常见的凭证位置，工作区外的其他文件（例如别的项目的源码）沙盒里仍然读得到
 - 工作区里的 `.git` 只读，沙盒里能 `git status`、`git diff`，不能 `git add`、`git commit`
-- `/private/tmp`、`/private/var/folders` 可写（很多系统组件依赖它们），Agent 可以在这里留下文件
+- `/private/tmp`、`/private/var/folders` 可写（很多系统组件依赖它们），Agent 可以在这里留下文件；沙盒里不能 `git init`（`.git` 在哪儿都只读），也用不了伪终端
+- 沙盒里的命令能读到同一个用户下其他进程启动时的环境变量（包括你的 shell），所以 key 不要 export，放文件里
+- 用 `setsid`、`setpgid` 脱离进程组的后台进程杀不到，命令结束后它们还会在沙盒里继续跑
 - 沙盒防的是模型被注入或犯错时读走凭证、改坏工作区外的东西、偷偷联网，不防内核漏洞；它和你共用同一个用户身份
+- 评测判分时被测代码和测试在同一个进程里，专门针对判分插件伪造结果的代码仍然能骗过判分；注入诱导率按字符串匹配，只是下限
 
 ## 许可证
 

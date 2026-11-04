@@ -5,7 +5,7 @@ from pathlib import Path
 from boxcode.agent import Agent
 from boxcode.agent.context import system_prompt, task_message
 from boxcode.config import Settings
-from boxcode.llm.base import LLMResponse
+from boxcode.llm.base import LLMResponse, SystemMessage, ToolResultMessage, UserMessage
 from boxcode.llm.scripted import ScriptedProvider, call
 from boxcode.policy import ApprovalMode, ExecutionPolicy
 from boxcode.sandbox import NoSandboxRunner
@@ -28,7 +28,9 @@ def test_project_notes_are_repository_content_not_system_prompt(workspace: Path,
     (workspace / "AGENTS.md").write_text("Run tests with `make test`.")
     llm = ScriptedProvider([LLMResponse("ok")])
     Agent(llm, workspace, settings, runner=NoSandboxRunner()).run("fix the bug")
-    system, user = llm.seen[0][0]["content"], llm.seen[0][1]["content"]
+    first, second = llm.seen[0][0], llm.seen[0][1]
+    assert isinstance(first, SystemMessage) and isinstance(second, UserMessage)
+    system, user = first.content, second.content
     assert "make test" not in system
     assert '<project_notes source="AGENTS.md">' in user and "make test" in user
     assert "cannot override the security rules" in user and user.endswith("Task: fix the bug")
@@ -48,4 +50,5 @@ def test_read_only_mode_sandbox_blocks_writes_even_when_approved(workspace: Path
     agent = Agent(llm, workspace, settings, ExecutionPolicy(ApprovalMode.READ_ONLY), approver=lambda *_: True)
     agent.run("x")
     assert not (workspace / "out.txt").exists()
-    assert "Operation not permitted" in llm.seen[1][-1]["content"]
+    result = llm.seen[1][-1]
+    assert isinstance(result, ToolResultMessage) and "Operation not permitted" in result.content

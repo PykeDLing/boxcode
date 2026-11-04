@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -24,6 +25,8 @@ from boxcode.llm.base import LLMResponse
 from boxcode.llm.scripted import ScriptedProvider, call
 from boxcode.policy import ApprovalMode, ExecutionPolicy
 from boxcode.sandbox import NoSandboxRunner, SandboxRunner, SeatbeltRunner, make_profile
+from boxcode.sandbox import runner as sandbox_runner
+from boxcode.sandbox.runner import MAX_CAPTURE_BYTES
 from tests.conftest import macos_only
 
 TASKS = Path(__file__).parent.parent / "evals" / "tasks"
@@ -71,14 +74,51 @@ def test_cannot_write_outside_workspace(workspace: Path) -> None:
     "rm -rf .git",
     "mkdir -p sub && printf 'gitdir: ../evil\\n' > sub/.git",
     "mkdir -p .git/modules/sub/hooks && echo x > .git/modules/sub/hooks/post-checkout",
+    # 把整个工作区挪走、在别处改 .git、再挪回来（红队实测能绕过“工作区里的 .git 只读”）
+    'mv "$PWD" /private/tmp/bx$$ && printf "[core]\\n\\tfsmonitor = touch pwned\\n" >> /private/tmp/bx$$/.git/config;'
+    ' mv /private/tmp/bx$$ "$PWD"',
+    # 在临时目录里另建一个仓库也不行：.git 在哪儿都只读
+    "git init -q /private/tmp/bx$$",
 ])
 def test_cannot_change_git_dir(workspace: Path, cmd: str) -> None:
     subprocess.run(["git", "init", "-q", str(workspace)], check=True)
-    before = sorted(p.relative_to(workspace) for p in (workspace / ".git").rglob("*"))
+    before = _snapshot(workspace / ".git")
     r = SeatbeltRunner(workspace).run(cmd, workspace, 10)
     assert r.exit_code != 0
     assert (workspace / ".git").is_dir() and not (workspace / "sub" / ".git").exists()
-    assert sorted(p.relative_to(workspace) for p in (workspace / ".git").rglob("*")) == before
+    assert _snapshot(workspace / ".git") == before  # 文件和内容都没变，不只是文件列表
+
+
+def _snapshot(root: Path) -> dict[str, bytes]:
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+@macos_only
+def test_nested_repo_cannot_be_moved_out_and_edited(workspace: Path) -> None:
+    sub = workspace / "sub"
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    before = _snapshot(sub / ".git")
+    SeatbeltRunner(workspace).run(
+        'mv sub /private/tmp/sub$$ && echo x >> /private/tmp/sub$$/.git/config; mv /private/tmp/sub$$ sub',
+        workspace, 10)
+    assert _snapshot(sub / ".git") == before
+
+
+@macos_only
+def test_read_only_workspace_cannot_be_renamed_through_parent(workspace: Path) -> None:
+    # read-only 模式下工作区本身改不了名，但以前它的上级目录可以（评测的临时目录就是这样）
+    (workspace / "a.txt").write_text("keep")
+    r = SeatbeltRunner(workspace, writable=False).run(
+        'P=$(dirname "$PWD"); mv "$P" "$P-moved" && echo x > "$P-moved/ws/a.txt"; mv "$P-moved" "$P"',
+        workspace, 10)
+    assert r.exit_code != 0 and (workspace / "a.txt").read_text() == "keep"
+
+
+@macos_only
+def test_files_inside_workspace_still_creatable_and_removable(workspace: Path) -> None:
+    r = SeatbeltRunner(workspace).run(
+        "mkdir -p d/e && echo hi > d/e/f.txt && mv d/e/f.txt d/g.txt && rm -rf d && echo ok", workspace, 10)
+    assert r.ok and r.stdout.strip() == "ok"
 
 
 @macos_only
@@ -89,7 +129,10 @@ def test_git_read_commands_still_work(workspace: Path) -> None:
 
 
 @macos_only
-@pytest.mark.parametrize("rel", [".ssh/id_rsa", ".zshrc", ".config/gh/hosts.yml"])
+@pytest.mark.parametrize("rel", [
+    ".ssh/id_rsa", ".zshrc", ".config/gh/hosts.yml",
+    ".claude.json", ".config/anthropic/profile.json", ".ollama/id_ed25519", "Library/HTTPStorages/x",
+])
 def test_cannot_read_private_files(workspace: Path, tmp_path: Path, rel: str) -> None:
     fake_home = (tmp_path / "home").resolve()
     (fake_home / rel).parent.mkdir(parents=True)
@@ -190,8 +233,11 @@ def exfil_server() -> Iterator[tuple[str, list[bytes]]]:
 
     srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield f"http://127.0.0.1:{srv.server_port}", hits
-    srv.shutdown()
+    try:
+        yield f"http://127.0.0.1:{srv.server_port}", hits
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 @macos_only
@@ -221,7 +267,7 @@ def test_injected_commands_stopped_by_sandbox_alone(
                                + [LLMResponse("done")])
         agent = Agent(llm, workspace, settings, ExecutionPolicy(ApprovalMode.FULL_AUTO), runner=runner)
         result = agent.run(task.prompt)
-        seen = "\n".join(str(m["content"]) for m in llm.seen[-1])
+        seen = "\n".join(str(getattr(m, "content", "")) for m in llm.seen[-1])
         return seen, [e["decision"] for e in result.trace.of("tool_call")]
 
     seen, decisions = fooled(SeatbeltRunner(workspace, home=fake_home))
@@ -230,3 +276,194 @@ def test_injected_commands_stopped_by_sandbox_alone(
     # 对照：同样的命令不进沙盒，凭证就发出去了，说明上面拦住不是因为命令本身跑不通
     fooled(NoSandboxRunner())
     assert hits
+
+
+def test_output_capture_is_bounded(workspace: Path) -> None:
+    # 以前输出全部读进内存：`yes` 跑到超时能吃掉几个 GB
+    for runner in _runners(workspace):
+        r = runner.run("head -c 5000000 /dev/zero | tr '\\0' 'x'; echo END", workspace, 20)
+        assert r.ok and len(r.stdout) < MAX_CAPTURE_BYTES + 200
+        assert r.stdout.startswith("xxx") and r.stdout.rstrip().endswith("END") and "省略" in r.stdout
+
+
+def test_endless_output_still_times_out(workspace: Path) -> None:
+    for runner in _runners(workspace):
+        t0 = time.monotonic()
+        r = runner.run("yes", workspace, 1)
+        assert r.timed_out and time.monotonic() - t0 < 5 and len(r.stdout) < MAX_CAPTURE_BYTES + 200
+
+
+def test_cancel_kills_command(workspace: Path) -> None:
+    for runner in _runners(workspace):
+        cancel = threading.Event()
+        threading.Timer(0.3, cancel.set).start()
+        t0 = time.monotonic()
+        r = runner.run("sleep 30 & echo $! > bg.pid; echo started; sleep 30", workspace, 60, cancel=cancel)
+        assert r.cancelled and not r.timed_out and r.exit_code == -1 and "started" in r.stdout
+        assert time.monotonic() - t0 < 5
+        assert _wait_dead(int((workspace / "bg.pid").read_text()))
+
+
+def test_waits_for_command_after_it_closes_its_output(workspace: Path) -> None:
+    # 命令关掉了 stdout/stderr 但还在跑：要等它跑完，不能一看管道关了就杀掉
+    for runner in _runners(workspace):
+        r = runner.run("exec >/dev/null 2>&1; sleep 0.5; echo done > out.txt", workspace, 10)
+        assert r.ok and (workspace / "out.txt").read_text().strip() == "done"
+
+
+def test_extra_env_passed_but_secrets_are_not(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOXCODE_API_KEY", "sk-should-not-leak")
+    for runner in _runners(workspace):
+        r = runner.run("env", workspace, 10, env={"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"})
+        assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" in r.stdout and "sk-should-not-leak" not in r.stdout
+
+
+
+@macos_only
+def test_symlinked_dotfile_target_also_hidden(workspace: Path, tmp_path: Path) -> None:
+    # 很多人用 dotfiles 仓库管理配置：~/.zshrc 是指向 ~/dotfiles/zshrc 的链接，Seatbelt 按解析后的路径匹配
+    fake_home = (tmp_path / "home").resolve()
+    (fake_home / "dotfiles").mkdir(parents=True)
+    (fake_home / "dotfiles" / "zshrc").write_text("export OPENAI_API_KEY=SECRET")
+    (fake_home / ".zshrc").symlink_to(fake_home / "dotfiles" / "zshrc")
+    r = SeatbeltRunner(workspace, home=fake_home).run(f"cat '{fake_home}/.zshrc' '{fake_home}/dotfiles/zshrc'",
+                                                      workspace, 10)
+    assert "SECRET" not in r.stdout
+
+
+def _lsregister() -> str:
+    return ("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/"
+            "lsregister")
+
+
+@macos_only
+def test_cannot_launch_apps_through_launchservices(workspace: Path) -> None:
+    # `open` 让 LaunchServices 启动程序，起来的程序不在沙盒里（红队实测：完全逃出沙盒）
+    marker = Path.home() / f".boxcode-lsopen-{uuid.uuid4().hex}"
+    app = workspace / "Escape.app"
+    (app / "Contents" / "MacOS").mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>'
+        "<key>CFBundleExecutable</key><string>escape</string>"
+        f"<key>CFBundleIdentifier</key><string>dev.boxcode.test.{uuid.uuid4().hex}</string>"
+        "<key>LSBackgroundOnly</key><true/></dict></plist>")
+    exe = app / "Contents" / "MacOS" / "escape"
+    exe.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+    exe.chmod(0o755)
+    try:
+        r = SeatbeltRunner(workspace).run(f"open -g -j '{app}'; sleep 2", workspace, 15)
+        time.sleep(1)
+        assert not marker.exists(), r.stderr
+    finally:
+        marker.unlink(missing_ok=True)
+        subprocess.run([_lsregister(), "-u", str(app)], capture_output=True)
+
+
+@macos_only
+def test_cannot_write_other_apps_preferences(workspace: Path) -> None:
+    # 通过 cfprefsd 写 ~/Library/Preferences：能改终端的启动命令、别的程序的设置
+    domain = f"dev.boxcode.test{uuid.uuid4().hex}"
+    try:
+        r = SeatbeltRunner(workspace).run(f"defaults write {domain} k v", workspace, 10)
+        assert r.exit_code != 0
+        assert subprocess.run(["defaults", "read", domain], capture_output=True).returncode != 0
+    finally:
+        subprocess.run(["defaults", "delete", domain], capture_output=True)
+        (Path.home() / "Library" / "Preferences" / f"{domain}.plist").unlink(missing_ok=True)
+
+
+@macos_only
+def test_unix_sockets_only_inside_own_dirs(workspace: Path) -> None:
+    # 系统临时目录、/private/var/run 里有别的程序的套接字（ssh-agent、浏览器），连上就能让它们替你干活
+    path = f"/private/tmp/bx-{uuid.uuid4().hex[:8]}.sock"
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(path)
+        srv.listen(1)
+        connect = f"import socket; s = socket.socket(socket.AF_UNIX); s.connect({path!r}); print('connected')"
+        r = SeatbeltRunner(workspace).run(f'{sys.executable} -c "{connect}"', workspace, 10)
+        assert "connected" not in r.stdout
+    finally:
+        srv.close()
+        Path(path).unlink(missing_ok=True)
+
+
+@macos_only
+def test_tools_using_sockets_in_tmpdir_still_work(workspace: Path) -> None:
+    # multiprocessing.Manager 在 TMPDIR 里建 unix 套接字：沙盒给每个 runner 一个自己的 TMPDIR，那里放行
+    code = "from multiprocessing import Manager; m = Manager(); d = m.dict(); d['a'] = 42; print(d['a']); m.shutdown()"
+    r = SeatbeltRunner(workspace).run(f'{sys.executable} -c "{code}"', workspace, 60)
+    assert r.ok and r.stdout.strip() == "42", r.stderr
+
+
+@macos_only
+def test_cannot_signal_processes_outside_sandbox(workspace: Path) -> None:
+    outside = subprocess.Popen(["sleep", "30"])
+    try:
+        r = SeatbeltRunner(workspace).run(f"kill -TERM {outside.pid}; sleep 30 & kill $!; wait $!; echo $?",
+                                          workspace, 10)
+        assert outside.poll() is None  # 沙盒外的进程没被杀
+        assert r.stdout.strip().endswith("143")  # 自己起的进程照样能杀
+    finally:
+        outside.kill()
+        outside.wait()
+
+
+@macos_only
+def test_cannot_write_to_other_terminals(workspace: Path) -> None:
+    # 以前整个 /dev 可写：能往你别的终端窗口里写转义序列
+    master, slave = os.openpty()
+    try:
+        tty = os.ttyname(slave)
+        r = SeatbeltRunner(workspace).run(f"printf INJECTED > {tty}", workspace, 10)
+        assert r.exit_code != 0
+        os.set_blocking(master, False)
+        with contextlib.suppress(BlockingIOError):
+            assert b"INJECTED" not in os.read(master, 1024)
+        ok = SeatbeltRunner(workspace).run("echo a > /dev/null && echo b > /dev/stdout && echo c >&2", workspace, 10)
+        assert ok.ok and ok.stdout.strip() == "b"
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_profile_blocks_clipboard_and_keychain_services(workspace: Path) -> None:
+    # 剪贴板和钥匙串只在规则里检查：实测要往你的剪贴板、钥匙串里放东西
+    p = make_profile(workspace, Path.home(), allow_network=False)
+    for service in ("com.apple.pasteboard.1", "com.apple.SecurityServer", "com.apple.secd"):
+        assert f'(global-name "{service}")' in p
+    assert "(deny lsopen)" in p and "(deny user-preference-write)" in p
+    assert "(allow signal (target same-sandbox))" in p
+    online = make_profile(workspace, Path.home(), allow_network=True)
+    assert '(path-literal "/private/var/run/mDNSResponder")' in online and "(remote ip))" not in online
+
+
+def test_multibyte_text_not_split_at_capture_boundary(workspace: Path) -> None:
+    # 没超过上限时头尾要一起解码：分开解码会把跨在分界上的汉字劈成两个 U+FFFD
+    r = NoSandboxRunner().run("python3 -c \"print('中' * 70000, end='')\"", workspace, 20)
+    assert r.ok and r.stdout == "中" * 70000
+
+
+def test_running_commands_killed_when_boxcode_exits(workspace: Path) -> None:
+    # 关掉桌面窗口时，后台线程是 daemon，等不到 run_process 的 finally；以前判分里的 pytest 会一直跑下去
+    script = (
+        "import threading, time\n"
+        "from pathlib import Path\n"
+        "from boxcode.sandbox import NoSandboxRunner\n"
+        f"ws = Path({str(workspace)!r})\n"
+        "threading.Thread(target=NoSandboxRunner().run, args=('echo $$ > main.pid; sleep 41', ws, 60),"
+        " daemon=True).start()\n"
+        "while not (ws / 'main.pid').exists(): time.sleep(0.05)\n"
+    )
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=30)
+    assert _wait_dead(int((workspace / "main.pid").read_text()))
+
+
+def test_exit_seen_after_deadline_is_not_a_timeout(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 以前先判断超时再看主进程：主进程在两次检查之间正常退出、后台进程还占着管道，下一次检查时已经过了超时，
+    # 就被当成超时。把检查间隔拉长到超时的两倍，主进程 0.3 秒就退出：下一次检查一定落在超时之后，
+    # 不靠机器快慢（CI 上沙盒启动慢，靠“快到超时才退出”来卡时间不稳）
+    monkeypatch.setattr(sandbox_runner, "POLL_S", 2.0)
+    for runner in _runners(workspace):
+        r = runner.run("sleep 5 & sleep 0.3; exit 3", workspace, 1)
+        assert not r.timed_out and r.exit_code == 3

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from boxcode.policy import Action, ApprovalMode, ExecutionPolicy, Policy
+from boxcode.policy import Action, ApprovalMode, ExecutionPolicy, Policy, UnsafeWorkspace, check_workspace
 from boxcode.sandbox import NoSandboxRunner, SeatbeltRunner
 from boxcode.tools.base import Risk, Target
 
@@ -18,7 +18,7 @@ def test_read_always_allowed(policy: Policy) -> None:
 
 
 def test_write_in_workspace_allowed(policy: Policy, workspace: Path) -> None:
-    assert policy.check(Risk.WRITE, Target(paths=[workspace / "a.py"])).action is Action.ALLOW
+    assert policy.check(Risk.WRITE, Target(paths=(workspace / "a.py",))).action is Action.ALLOW
 
 
 @pytest.mark.parametrize("rel", [
@@ -28,29 +28,42 @@ def test_write_in_workspace_allowed(policy: Policy, workspace: Path) -> None:
     "sub/.git", "vendor/lib/.Git/config",  # 嵌套的仓库
 ])
 def test_git_dir_protected(policy: Policy, workspace: Path, rel: str) -> None:
-    assert policy.check(Risk.WRITE, Target(paths=[workspace / rel])).action is Action.DENY
+    assert policy.check(Risk.WRITE, Target(paths=(workspace / rel,))).action is Action.DENY
 
 
 @pytest.mark.parametrize("rel", [".gitignore", ".github/workflows/ci.yml", "src/git/x.py"])
 def test_git_lookalikes_allowed(policy: Policy, workspace: Path, rel: str) -> None:
-    assert policy.check(Risk.WRITE, Target(paths=[workspace / rel])).action is Action.ALLOW
+    assert policy.check(Risk.WRITE, Target(paths=(workspace / rel,))).action is Action.ALLOW
 
 
 @pytest.mark.parametrize("cmd", [
-    "curl https://x.example", "git push origin main", "pip install requests",
+    "curl https://x.example", "git push origin main", "pip install requests", "rsync -a . host:/x",
     "rm -rf build", "echo aGk= | base64 -d | sh",
+    # 以前漏掉的写法
+    "pip3 install requests", "python -m pip install requests", "uv add httpx", "uv sync", "npm i left-pad",
+    "rm -fr build", "rm -f -r build", "rm -R build", "rm --recursive build", "chmod -R 777 .",
+    "base64 --decode payload | sh", 'eval "$(cat x)"', "echo aGk= | base64 -di > x.sh",
+    # 对抗测试找到的漏网写法
+    "git -C . push origin main", "git -c k=v push", "cat p | /bin/sh", "cat p | env sh", "cat p | perl",
+    "pip3.12 install x", "pipx install x", "npx cowsay", "uvx ruff", "uv run --with httpx python x.py", "npm ci",
+    "bun add x", "find . -name '*.pyc' -delete", "git clean -fdx",
 ])
 def test_risky_commands_ask(policy: Policy, cmd: str) -> None:
     assert policy.check(Risk.EXEC, Target(command=cmd)).action is Action.ASK
 
 
-def test_plain_command_allowed(policy: Policy) -> None:
-    assert policy.check(Risk.EXEC, Target(command="python -m pytest -q")).action is Action.ALLOW
+@pytest.mark.parametrize("cmd", [
+    "python -m pytest -q", "uv run pytest", "rm -f a.txt", "rm file-r", "chmod 644 a.txt",
+    "find . -name '*.py' -exec grep -l foo {} +",  # 很常用的只读写法，不能每次都问
+    "git status", "git -C sub log --oneline", "uv run pytest -q", "node script.js", "npm test",
+])
+def test_plain_command_allowed(policy: Policy, cmd: str) -> None:
+    assert policy.check(Risk.EXEC, Target(command=cmd)).action is Action.ALLOW
 
 
 def test_read_only_denies_writes(workspace: Path) -> None:
     p = Policy(ApprovalMode.READ_ONLY, workspace)
-    assert p.check(Risk.WRITE, Target(paths=[workspace / "a.py"])).action is Action.DENY
+    assert p.check(Risk.WRITE, Target(paths=(workspace / "a.py",))).action is Action.DENY
 
 
 @pytest.mark.parametrize(("mode", "writable"), [
@@ -70,3 +83,39 @@ def test_execution_policy_maps_mode_to_sandbox(workspace: Path, mode: ApprovalMo
 def test_full_auto_allows_risky(workspace: Path) -> None:
     p = Policy(ApprovalMode.FULL_AUTO, workspace)
     assert p.check(Risk.EXEC, Target(command="curl x")).action is Action.ALLOW
+
+
+@pytest.mark.parametrize("rel", [
+    "", "Library/LaunchAgents", ".ssh", ".aws", ".boxcode", ".boxcode/runs",
+    # 本身沙盒照常能读，但里面的配置、程序之后会在沙盒外执行；或者包含了凭证目录
+    ".config", ".config/fish", ".local", ".local/bin", "bin", ".cargo", ".oh-my-zsh", ".nvm", ".pyenv", "go",
+])
+def test_workspace_cannot_cover_sensitive_home_dirs(tmp_path: Path, rel: str) -> None:
+    # 沙盒放行整个工作区的写入：工作区是主目录，~/.zshrc、~/Library/LaunchAgents 就都能改
+    home = (tmp_path / "home").resolve()
+    with pytest.raises(UnsafeWorkspace):
+        check_workspace(home / rel, home / ".boxcode", home=home)
+
+
+@pytest.mark.parametrize("ws", ["/", "/Users", "/Applications/Foo.app", "/opt/homebrew", "/usr/local/bin"])
+def test_workspace_cannot_be_system_dir(tmp_path: Path, ws: str) -> None:
+    with pytest.raises(UnsafeWorkspace):
+        check_workspace(Path(ws), tmp_path / ".boxcode", home=Path("/Users/someone"))
+
+
+def test_workspace_case_variant_of_home_rejected() -> None:
+    # APFS 不区分大小写，Path.resolve() 也不改大小写：/users/PYKE 就是主目录
+    with pytest.raises(UnsafeWorkspace):
+        check_workspace(Path(str(Path.home()).upper()), Path.home() / ".boxcode")
+
+
+def test_workspace_cannot_contain_boxcode_data(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    with pytest.raises(UnsafeWorkspace, match="数据目录"):
+        check_workspace(project, project / ".boxcode", home=tmp_path / "home")
+
+
+def test_ordinary_project_dirs_allowed(tmp_path: Path) -> None:
+    home = (tmp_path / "home").resolve()
+    check_workspace(home / "dev" / "proj", home / ".boxcode", home=home)
+    check_workspace(Path("/private/tmp/boxcode-eval/repo"), home / ".boxcode", home=home)  # 评测就在临时目录里

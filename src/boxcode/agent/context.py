@@ -6,7 +6,8 @@ TODO（第 3 周）：对话太长时压缩旧的工具结果；生成代码库�
 from pathlib import Path
 
 from boxcode.policy import ExecutionPolicy
-from boxcode.tools.base import in_workspace
+from boxcode.tools.base import ToolError
+from boxcode.tools.fs import read_workspace_bytes
 
 SYSTEM_PROMPT = """You are BoxCode, a coding agent working inside the repository at {workspace}.
 
@@ -36,9 +37,11 @@ def project_notes(workspace: Path) -> tuple[str, str] | None:
     """返回（文件名，内容）。在 Agent 进程里读，所以指向工作区外的链接不跟：否则仓库里放一个
     指向 ~/.aws/credentials 的 AGENTS.md，启动时就把凭证发给模型了。"""
     for name in PROJECT_FILES:
-        p = workspace / name
-        if p.is_file() and in_workspace(workspace, p):
-            return name, p.read_text(errors="replace")[:MAX_PROJECT_NOTES]
+        try:
+            data = read_workspace_bytes(workspace, name)
+        except (ToolError, OSError):
+            continue  # 没有、不是普通文件、或者指向工作区外
+        return name, data.decode(errors="replace")[:MAX_PROJECT_NOTES]
     return None
 
 

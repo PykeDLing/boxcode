@@ -1,6 +1,6 @@
 [project]
 name = "boxcode"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A command-line coding agent whose every command runs inside a macOS Seatbelt sandbox"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,18 +33,39 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "src/boxcode/__init__.py"
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "SIM"]
+select = [
+    "E", "F", "W", "I", "B", "UP", "SIM", "C4", "PIE", "RET", "PTH", "PERF", "RUF",
+    "S",  # bandit：安全相关的写法
+]
+ignore = [
+    "RUF001", "RUF002", "RUF003",  # 中文注释和文案里的全角标点
+    "S101",  # assert 用在类型收窄上
+    "S603",  # subprocess 的参数都是列表，并且只在 sandbox/ 里调用
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "PTH"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src/boxcode"]
+files = ["src/boxcode", "tests"]
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["macos: needs macOS sandbox-exec"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+filterwarnings = ["error"]
+markers = ["macos: needs macOS sandbox-exec (skipped elsewhere)"]

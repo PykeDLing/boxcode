@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from boxcode.paths import canonical, is_inside
 from boxcode.sandbox import SandboxRunner, default_runner
+from boxcode.sandbox.seatbelt import PRIVATE_READS
 from boxcode.tools.base import Risk, Target
 
 
@@ -36,6 +38,49 @@ class ExecutionPolicy:
                               no_sandbox=not self.sandboxed)
 
 
+# 不能当工作区的系统目录（含它们下面的目录）：沙盒放行整个工作区的写入，/Applications、/opt/homebrew
+# 这些地方普通用户也能写，改了里面的程序，你下次在沙盒外运行它就会执行
+SYSTEM_DIRS = ("/Applications", "/Library", "/System", "/usr", "/bin", "/sbin", "/etc", "/private/etc", "/opt")
+# 主目录里沙盒照常能读、但不能整个交给模型写的位置：里面的配置和程序之后会在沙盒外执行
+# （~/.config/git/config 的 core.fsmonitor、fish 的 config.fish、~/.local/bin 里的命令）
+HOME_EXEC_DIRS = (
+    ".config", ".local", "bin", "go", ".oh-my-zsh", ".nvm", ".pyenv", ".rbenv", ".bun", ".deno", ".ipython", ".vim",
+    ".hammerspoon",
+)
+
+
+class UnsafeWorkspace(ValueError):
+    """工作区选在了沙盒不该放行写入的位置。"""
+
+
+def check_workspace(workspace: Path, boxcode_home: Path, home: Path | None = None) -> None:
+    """沙盒放行整个工作区的写入，所以工作区不能是这些地方：
+
+    - 根目录、主目录和它们之间的目录：等于把 ~/.zshrc、~/Library/LaunchAgents 都交给了模型
+    - 主目录里放凭证和其他 App 数据的位置（沙盒本来不让读的那些）、~/Library、HOME_EXEC_DIRS，
+      以及包含它们的目录（例如 ~/.cargo 包含 ~/.cargo/credentials）
+    - BoxCode 自己的数据目录（执行轨迹），或者包含它的目录
+    - SYSTEM_DIRS 里的系统目录
+    """
+    # 换成磁盘上真实的大小写再比，并且比较时不区分大小写：APFS 上 /users/PYKE 就是主目录
+    ws = canonical(workspace)
+    home = canonical(home or Path.home())
+    data = canonical(boxcode_home)
+
+    inside = is_inside
+    if inside(home, ws):  # 工作区是主目录，或者是它的上级目录
+        raise UnsafeWorkspace(f"工作区不能是根目录、主目录或它们之间的目录：{ws}。选一个具体的项目目录")
+    if inside(ws, data) or inside(data, ws):
+        raise UnsafeWorkspace(f"工作区不能包含 BoxCode 的数据目录 {data}，也不能在它里面")
+    home_roots = [home / "Library", *(home / p for p in (*PRIVATE_READS, *HOME_EXEC_DIRS))]
+    for root in (*home_roots, *map(Path, SYSTEM_DIRS)):
+        if inside(ws, root):
+            raise UnsafeWorkspace(f"工作区不能放在 {root} 里：{ws}")
+    for root in home_roots:
+        if inside(root, ws):
+            raise UnsafeWorkspace(f"工作区不能包含 {root}：{ws}")
+
+
 class Action(StrEnum):
     ALLOW = "allow"
     ASK = "ask"
@@ -53,14 +98,18 @@ class Decision:
 PROTECTED_DIR = ".git"
 
 # 要先问人的命令
-RISKY_COMMANDS: tuple[tuple[str, str], ...] = (
-    (r"\b(curl|wget|nc|ssh|scp)\b", "联网或远程访问"),
-    (r"\bgit\s+(push|remote|config)\b", "改动远程仓库或 git 配置"),
-    (r"\b(pip|uv\s+pip|npm|pnpm|yarn|brew)\s+(install|add|i)\b", "安装依赖"),
-    (r"\brm\s+-\w*r", "递归删除"),
-    (r"\b(sudo|chmod\s+-R|chown)\b", "改权限或提权"),
-    (r"(base64\s+-d|\|\s*(sh|bash|zsh|python3?)\b)", "执行解码或下载来的内容"),
-)
+RISKY_COMMANDS: tuple[tuple[re.Pattern[str], str], ...] = tuple((re.compile(p), why) for p, why in (
+    (r"\b(curl|wget|nc|ncat|ssh|scp|sftp|rsync|ftp|telnet|nscurl)\b", "联网或远程访问"),
+    # git -C . push、git -c k=v push 也算
+    (r"\bgit(\s+-[Cc]\s+\S+|\s+--?[\w-]+(=\S+)?)*\s+(push|remote|config)\b", "改动远程仓库或 git 配置"),
+    (r"\b(pip3?(\.\d+)?|pipx|uv|npm|pnpm|yarn|bun|brew|poetry|cargo|gem|go)\s+(pip\s+)?(install|add|i|ci|sync)\b"
+     r"|\bpython3?\s+-m\s+pip\s+install\b|\b(npx|uvx|bunx|pnpx)\s|\buv\s+run\s+(\S+\s+)*--with\b", "安装依赖"),
+    # -r、-R、-rf、-f -r、--recursive 都算
+    (r"\brm\s+(-\w+\s+)*(-\w*[rR]\w*|--recursive)\b|\bfind\b.*\s-delete\b|\bgit\s+clean\b", "递归删除"),
+    (r"\b(sudo|chown)\b|\bchmod\s+(-\w+\s+)*-\w*R", "改权限或提权"),
+    (r"base64\s+(-\w*[dD]\w*|--decode)\b|\|\s*(\S*/)?(env\s+)?(sh|bash|zsh|dash|python3?|perl|ruby|node)\b"
+     r"|\beval\s", "执行解码或下载来的内容"),
+))
 
 
 class Policy:
@@ -88,6 +137,6 @@ class Policy:
         if self.mode is ApprovalMode.READ_ONLY:
             return Decision(Action.ASK, "只读模式下执行命令需要确认")
         for pattern, why in RISKY_COMMANDS:
-            if re.search(pattern, command):
+            if pattern.search(command):
                 return Decision(Action.ASK, f"高风险命令（{why}）")
         return Decision(Action.ALLOW, "在沙盒中执行")

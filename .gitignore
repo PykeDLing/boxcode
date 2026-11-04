@@ -28,3 +28,6 @@ evals/results/
 .idea/
 .vscode/
 *.swp
+
+# Claude Code 给子代理建的临时 worktree
+.claude/worktrees/

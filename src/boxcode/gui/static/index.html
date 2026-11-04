@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <!--
-  只放行带本次随机 nonce 的脚本，不许加载任何外部资源、不许联网。
+  只放行带本次随机 nonce 的脚本，不许加载任何外部资源、不许联网，表单不许提交到别处、不许改 base。
   'unsafe-eval' 是 pywebview 生成 js_api 时要用的 new Function；没有 nonce 的脚本照样跑不起来。
 -->
 <meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'nonce-{{nonce}}' 'unsafe-eval'; style-src 'unsafe-inline'; img-src data:">
+      content="default-src 'none'; script-src 'nonce-{{nonce}}' 'unsafe-eval'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <title>BoxCode</title>
 <style>/*{{style}}*/</style>
 </head>
@@ -147,6 +147,6 @@
   </main>
 </div>
 <div class="toast" id="toast" role="status" hidden></div>
-<script nonce="{{nonce}}">/*{{script}}*/</script>
+<script nonce="{{nonce}}" data-token="{{token}}">/*{{script}}*/</script>
 </body>
 </html>
