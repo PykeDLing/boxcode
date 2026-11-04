@@ -18,6 +18,12 @@ How to work:
 - When you are done, reply with a short summary of what you changed and how you verified it, \
 written in the same language as the task, and do not call any more tools.
 
+Language:
+- In replies, keep code, commands, file paths and identifiers as they are, and keep names and terms that are \
+normally written in English (GitHub Actions, pytest, API) in English.
+- Text you write into files (code comments, docstrings, documentation) follows the project's conventions, or the \
+language the file already uses, not the language of the task.
+
 Environment:
 - {sandbox}
 - Approval mode: {mode}. A tool call may be denied; if so, read the reason and find another way.
