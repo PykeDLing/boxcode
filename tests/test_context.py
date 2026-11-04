@@ -23,9 +23,14 @@ def test_prompt_describes_actual_sandbox(workspace: Path) -> None:
     assert "WITHOUT a sandbox" in no_box_ro and "do not modify any files" in no_box_ro
 
 
-def test_prompt_asks_for_replies_in_task_language(workspace: Path) -> None:
-    # 中文任务以前有时整段用英文回复：项目说明的包装、自检反馈都是英文，模型会跟着换语言
-    assert "in the same language as the task" in system_prompt(workspace, ExecutionPolicy())
+def test_prompt_separates_reply_language_from_file_language(workspace: Path) -> None:
+    prompt = system_prompt(workspace, ExecutionPolicy())
+    # 回复跟着任务的语言走：中文任务以前有时整段用英文回复（项目说明的包装、自检反馈都是英文）
+    assert "in the same language as the task" in prompt
+    # 代码、命令、路径和惯用英文的名词不翻译
+    assert "identifiers as they are" in prompt and "GitHub Actions, pytest, API" in prompt
+    # 写进文件的注释、文档跟项目约定走，不跟任务的语言走
+    assert "follows the project's conventions" in prompt and "not the language of the task" in prompt
 
 
 def test_project_notes_are_repository_content_not_system_prompt(workspace: Path, settings: Settings) -> None:
