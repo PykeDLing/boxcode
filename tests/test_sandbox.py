@@ -25,6 +25,7 @@ from boxcode.llm.base import LLMResponse
 from boxcode.llm.scripted import ScriptedProvider, call
 from boxcode.policy import ApprovalMode, ExecutionPolicy
 from boxcode.sandbox import NoSandboxRunner, SandboxRunner, SeatbeltRunner, make_profile
+from boxcode.sandbox import runner as sandbox_runner
 from boxcode.sandbox.runner import MAX_CAPTURE_BYTES
 from tests.conftest import macos_only
 
@@ -458,8 +459,11 @@ def test_running_commands_killed_when_boxcode_exits(workspace: Path) -> None:
     assert _wait_dead(int((workspace / "main.pid").read_text()))
 
 
-def test_normal_exit_near_deadline_is_not_a_timeout(workspace: Path) -> None:
-    # 以前先判断超时再看主进程：快到超时才退出、后台进程还占着管道的，会被当成超时
+def test_exit_seen_after_deadline_is_not_a_timeout(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 以前先判断超时再看主进程：主进程在两次检查之间正常退出、后台进程还占着管道，下一次检查时已经过了超时，
+    # 就被当成超时。把检查间隔拉长到超时的两倍，主进程 0.3 秒就退出：下一次检查一定落在超时之后，
+    # 不靠机器快慢（CI 上沙盒启动慢，靠“快到超时才退出”来卡时间不稳）
+    monkeypatch.setattr(sandbox_runner, "POLL_S", 2.0)
     for runner in _runners(workspace):
-        r = runner.run("sleep 5 & sleep 0.95; exit 3", workspace, 1)
+        r = runner.run("sleep 5 & sleep 0.3; exit 3", workspace, 1)
         assert not r.timed_out and r.exit_code == 3
