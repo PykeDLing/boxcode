@@ -1,6 +1,6 @@
 """执行轨迹：每一步一行 JSON。评测统计、失败归因、回放都从这里读。
 
-事件类型：run_start、llm_call、llm_error、tool_call、verify、run_end。
+事件类型：run_start、llm_call、llm_error、tool_call、hook_error、verify、run_end。
 
 写文件失败（磁盘满了、目录被删）不抛异常：事件照样留在内存里、照样推给界面，第一次的错误记在 write_error 里。
 轨迹是旁路记录，不能因为它让一次运行崩掉。

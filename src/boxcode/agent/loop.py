@@ -17,7 +17,8 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from boxcode.agent.context import system_prompt, task_message
+from boxcode.agent.context import DEFAULT_SECTIONS, PromptSection, system_prompt, task_message
+from boxcode.agent.hooks import HookCall, ToolHook, ToolHooks
 from boxcode.config import Settings
 from boxcode.llm.base import (
     LLMCancelled,
@@ -93,6 +94,8 @@ class Agent:
         trace: TraceRecorder | None = None,
         runner: SandboxRunner | None = None,  # 默认按 execution 生成；测试里换成 NoSandboxRunner
         cancel: threading.Event | None = None,
+        hooks: Sequence[ToolHook] = (),
+        prompt_sections: Sequence[PromptSection] = DEFAULT_SECTIONS,
     ) -> None:
         self.llm = llm
         self.workspace = canonical(workspace)  # 解析链接、换成磁盘上真实的大小写
@@ -106,6 +109,8 @@ class Agent:
         self.ctx = ToolContext(self.workspace, runner or self.execution.make_runner(self.workspace), settings,
                                self.cancel)
         self.trace = trace or TraceRecorder(settings.runs_dir)
+        self.hooks = ToolHooks(hooks, self.trace)
+        self.prompt_sections = tuple(prompt_sections)
         self._state: _State | None = None
 
     def run(self, task: str, verify_command: str | None = None) -> RunResult:
@@ -115,7 +120,8 @@ class Agent:
         try:
             self.trace.emit("run_start", task=task, model=self.llm.name, mode=self.execution.mode.value,
                             allow_network=self.execution.allow_network, sandbox=self.ctx.runner.name,
-                            workspace=str(self.workspace), verify=verify_command)
+                            workspace=str(self.workspace), verify=verify_command,
+                            prompt_sections=[s.id for s in self.prompt_sections])
             return self._loop(state, task, verify_command)
         except KeyboardInterrupt:
             self.cancel.set()  # 后台线程里还没回来的模型请求也断开
@@ -126,7 +132,7 @@ class Agent:
             return self._finish(Status.CRASHED, f"{type(e).__name__}: {e}", traceback=traceback.format_exc())
 
     def _loop(self, state: _State, task: str, verify_command: str | None) -> RunResult:
-        state.messages = [SystemMessage(system_prompt(self.workspace, self.execution)),
+        state.messages = [SystemMessage(system_prompt(self.workspace, self.execution, self.prompt_sections)),
                           UserMessage(task_message(self.workspace, task))]
         specs = [t.spec() for t in self.tools.values()]
         while state.turn < self.settings.max_turns:
@@ -221,6 +227,7 @@ class Agent:
         t0 = time.monotonic()
         decision: Decision | None = None
         exception: str | None = None  # 没预料到的异常类型：轨迹里要能分清是 BoxCode 的 bug 还是模型用错了
+        started: HookCall | None = None  # 工具真的开始执行了才有值，这样的调用才走 after 钩子
         try:
             if self.cancel.is_set():
                 raise ToolError("用户已停止这次运行，没有执行")
@@ -231,7 +238,10 @@ class Agent:
                 params = tool.parse(call.arguments)
             except ValidationError as e:
                 raise ToolError(f"参数不对：{_validation_message(e)}") from e
-            decision = self.policy.check(tool.risk, tool.target(self.ctx, params))
+            target = tool.target(self.ctx, params)
+            hook_call = HookCall(tool.name, tool.risk, params, target, turn)
+            # 钩子排在权限策略之后、问用户之前：只能在策略的结论上收紧
+            decision = self.hooks.before(hook_call, self.policy.check(tool.risk, target))
             if decision.action is Action.ASK:
                 approved = self.approver(tool, params, decision)
                 decision = Decision(Action.ALLOW if approved else Action.DENY,
@@ -239,6 +249,7 @@ class Agent:
             if decision.action is Action.DENY:
                 result = ToolResult(f"被权限策略拒绝：{decision.reason}", ok=False)
             else:
+                started = hook_call
                 result = tool.run(self.ctx, params)
         except ToolError as e:
             result = ToolResult(f"错误：{e}", ok=False)
@@ -246,7 +257,9 @@ class Agent:
             # 工具里没预料到的异常（没有权限、磁盘满了）同样回给模型，不让整次运行崩掉
             exception = type(e).__name__
             result = ToolResult(f"错误：{exception}: {e}", ok=False)
-        # 所有工具的输出都在这里统一截断：单个工具忘了截断，也撑不爆上下文
+        if started is not None:
+            result = self.hooks.after(started, result)
+        # 所有工具的输出都在这里统一截断（在钩子之后）：单个工具或钩子忘了截断，也撑不爆上下文
         result = ToolResult(truncate(result.text, self.settings.max_tool_output), result.ok)
         self.trace.emit("tool_call", turn=turn, tool=call.name, arguments=call.arguments,
                         decision=decision.action.value if decision else "invalid",

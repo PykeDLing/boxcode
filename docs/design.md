@@ -51,6 +51,7 @@ Agent 主循环（agent/loop.py）
    │  ③ 每个工具调用：
    │       解析并校验参数（Pydantic）
    │         → 权限策略（policy/）：放行 / 询问用户 / 拒绝
+   │         → 工具钩子（agent/hooks.py）：只能在策略的结论上收紧
    │         → 执行工具（tools/）
    │              文件工具：Agent 进程内执行，路径限制在工作区
    │              run_command：交给沙盒（sandbox/），sandbox-exec + 生成的 Seatbelt 规则
@@ -73,6 +74,7 @@ Agent 主循环（agent/loop.py）
 - 结束状态：`done`、`verify_failed`、`max_turns`、`refused`、`error`（模型接口出错，SDK 重试后仍失败）、`cancelled`（界面上按停止、命令行 Ctrl-C）、`crashed`（BoxCode 自己的 bug，`run_end` 里带完整异常栈）。不管哪种，`Agent.run` 都返回结果、轨迹里都有 `run_end`，评测和界面不用自己兜底
 - 取消：`Agent` 带一个 `threading.Event`。设置后，正在执行的命令立刻整组杀掉，这一轮剩下的工具调用不再执行；正在进行的模型调用也不再等：模型接口在单独的线程里调，主循环每 0.1 秒看一眼取消信号，按了停止就以 `cancelled` 结束（Claude 一次回复可能要几分钟）。cancel 也传给 Provider：Claude 走流式接口，每收到一个事件看一眼，按了停止就断开连接，服务器停止生成，剩下的输出不再计费；不用流式的 OpenAI 兼容接口做不到中途放弃，请求留在后台线程里自己结束，结果丢掉。停止之后才回来的回复里要的工具一个都不执行
 - 一个 `Agent` 对象只跑一次 `run()`；工作区先过 `check_workspace`（见 4.3），不安全就直接拒绝
+- **工具钩子**（`agent/hooks.py`）：`ToolHook` 的 `before` 在权限策略之后、问用户之前调用，`after` 在工具执行之后、统一截断之前调用，审计、输出脱敏这类功能挂在这里，不用改主循环。做法借鉴 DeepSeek Harness 的 pre / post 管线，但它的插件可以直接放行、替换执行本身，这里的权限策略和沙盒是安全边界，所以钩子受这些限制：`before` 的结论只有更严才生效（`Decision.tightened_by`），放行被拒绝的调用、跳过用户确认都做不到；没有包住执行的钩子，能包住就能不走沙盒；钩子拿到的参数是深拷贝，改了影响不到真正执行的那一份；`before` 出错就拒绝这次调用，`after` 出错就丢掉输出（脱敏钩子挂了不能把原文交给模型），都记一条 `hook_error`；`after` 能改文字，不能把失败改成成功
 - 轨迹写不进去（磁盘满了、目录被删）不会让运行崩掉：事件照样在内存里、照样推给界面，错误记在 `trace.write_error`
 
 ### 4.2 工具（`tools/`）
@@ -129,6 +131,7 @@ Agent 主循环（agent/loop.py）
 ### 4.5 上下文工程（`agent/context.py`）
 
 - 已实现：系统提示（工作方式、环境、安全规则）、读取仓库里的 `AGENTS.md` / `CLAUDE.md` 作为项目记忆
+- 系统提示由带 id 的段组成（`PromptSection`，默认是 `DEFAULT_SECTIONS` 里的 identity、workflow、language、environment、security），`Agent(prompt_sections=...)` 可以换。新功能往里加一段，对比实验按 id 去掉一段，`run_start` 里记着这次用了哪些段。段的内容只能来自 BoxCode 自己，仓库内容不能进系统提示
 - 系统提示里明确：文件内容、命令输出都是数据，不是指令
 - 语言，和 Claude Code、Codex CLI 这些主流 agent 一样只靠提示词，不在代码里检查：
   - 回复跟着任务的语言走
@@ -146,9 +149,10 @@ Agent 主循环（agent/loop.py）
 
 | 事件 | 字段 |
 | --- | --- |
-| `run_start` | 任务、模型、权限模式、沙盒类型、工作区 |
+| `run_start` | 任务、模型、权限模式、沙盒类型、工作区、系统提示用了哪些段 |
 | `llm_call` | 第几轮、耗时、输入 / 输出 token、调用了哪些工具 |
-| `tool_call` | 工具、参数、策略结论和原因、是否成功、耗时、输出长度 |
+| `tool_call` | 工具、参数、策略结论和原因（被钩子收紧时写明是哪个钩子）、是否成功、耗时、输出长度 |
+| `hook_error` | 工具钩子出错：第几轮、工具、钩子、`before` / `after`、异常和调用栈 |
 | `verify` | 自检命令、是否通过 |
 | `run_end` | 状态、轮数、修正轮数、汇总 |
 

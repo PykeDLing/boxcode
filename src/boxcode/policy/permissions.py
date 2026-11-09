@@ -87,10 +87,17 @@ class Action(StrEnum):
     DENY = "deny"
 
 
+_STRICTNESS = {Action.ALLOW: 0, Action.ASK: 1, Action.DENY: 2}
+
+
 @dataclass(frozen=True)
 class Decision:
     action: Action
     reason: str
+
+    def tightened_by(self, other: "Decision") -> "Decision":
+        """other 比自己严才换成它，否则保持不变：工具钩子靠这一点，只能收紧权限，放不宽。"""
+        return other if _STRICTNESS[other.action] > _STRICTNESS[self.action] else self
 
 
 # 工作区里也不许改的位置：任何一层的 .git。改了 hook、core.fsmonitor，或者把 .git 换成指向别处的文件，

@@ -218,6 +218,12 @@ function timelineItem(e, t0) {
       title = [h("strong", { text: "模型接口出错" })];
       meta.push(e.error || "");
       break;
+    case "hook_error":
+      dot = "critical";
+      title = [h("strong", { text: "工具钩子出错" }), h("code", { class: "chip", text: e.hook })];
+      meta.push(`${e.tool} · ${e.stage === "before" ? "执行前，这次调用被拒绝" : "执行后，输出已丢弃"}`);
+      meta.push(e.error || "");
+      break;
     case "run_end": {
       const s = lookup(STATUS, e.status) || STATUS.unfinished;
       dot = s.tone === "accent" || s.tone === "muted" ? "" : s.tone;
