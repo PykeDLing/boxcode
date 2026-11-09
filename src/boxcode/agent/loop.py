@@ -17,8 +17,10 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from boxcode.agent.compaction import ContextCompactor
 from boxcode.agent.context import DEFAULT_SECTIONS, PromptSection, fenced_tag, system_prompt, task_message
 from boxcode.agent.hooks import HookCall, ToolHook, ToolHooks
+from boxcode.agent.repomap import build_repo_map
 from boxcode.config import Settings
 from boxcode.llm.base import (
     LLMCancelled,
@@ -26,18 +28,21 @@ from boxcode.llm.base import (
     LLMResponse,
     LLMUnavailable,
     Message,
+    ServerCompaction,
     StopReason,
     SystemMessage,
     ToolCall,
     ToolResultMessage,
     ToolSpec,
     UserMessage,
+    clears_tool_results,
 )
 from boxcode.paths import canonical
 from boxcode.policy import Action, Decision, ExecutionPolicy, Policy, check_workspace
 from boxcode.sandbox import SandboxRunner
 from boxcode.tools import Tool, ToolContext, ToolError, ToolResult, default_tools
 from boxcode.tools.base import truncate
+from boxcode.tools.plan import PLAN_TOOL
 from boxcode.trace import TraceRecorder
 
 # 权限策略说“要问”时调用：返回 True 放行。评测时用 deny_all（一律不放行）
@@ -78,6 +83,8 @@ class _State:
     messages: list[Message] = field(default_factory=list)
     turn: int = 0
     fix_rounds: int = 0
+    # 服务器目前累计清理了多少
+    server_cleared: ServerCompaction = field(default_factory=lambda: ServerCompaction(0, 0))
 
 
 class Agent:
@@ -103,14 +110,17 @@ class Agent:
         self.settings = settings
         self.execution = execution or ExecutionPolicy()
         self.approver = approver
-        self.tools: dict[str, Tool[Any]] = {t.name: t for t in (tools if tools is not None else default_tools())}
+        chosen = tools if tools is not None else default_tools(planning=settings.planning)
+        self.tools: dict[str, Tool[Any]] = {t.name: t for t in chosen}
         self.policy = Policy(self.execution.mode, self.workspace)
         self.cancel = cancel or threading.Event()
         self.ctx = ToolContext(self.workspace, runner or self.execution.make_runner(self.workspace), settings,
-                               self.cancel)
+                               self.cancel, self._record)
         self.trace = trace or TraceRecorder(settings.runs_dir)
         self.hooks = ToolHooks(hooks, self.trace)
         self.prompt_sections = tuple(prompt_sections)
+        # 服务器负责清理时，客户端不能再改发出去的历史（Claude 的思考块签名绑定了它前面的全部内容）
+        self._compactor = ContextCompactor(0 if clears_tool_results(llm) else settings.context_compact_tokens)
         self._state: _State | None = None
 
     def run(self, task: str, verify_command: str | None = None) -> RunResult:
@@ -121,7 +131,9 @@ class Agent:
             self.trace.emit("run_start", task=task, model=self.llm.name, mode=self.execution.mode.value,
                             allow_network=self.execution.allow_network, sandbox=self.ctx.runner.name,
                             workspace=str(self.workspace), verify=verify_command,
-                            prompt_sections=[s.id for s in self.prompt_sections])
+                            prompt_sections=[s.id for s in self.prompt_sections],
+                            context_compact_tokens=self.settings.context_compact_tokens,
+                            repo_map_chars=self.settings.repo_map_chars, planning=PLAN_TOOL in self.tools)
             return self._loop(state, task, verify_command)
         except KeyboardInterrupt:
             self.cancel.set()  # 后台线程里还没回来的模型请求也断开
@@ -132,21 +144,26 @@ class Agent:
             return self._finish(Status.CRASHED, f"{type(e).__name__}: {e}", traceback=traceback.format_exc())
 
     def _loop(self, state: _State, task: str, verify_command: str | None) -> RunResult:
-        state.messages = [SystemMessage(system_prompt(self.workspace, self.execution, self.prompt_sections)),
-                          UserMessage(task_message(self.workspace, task))]
+        repo_map = self._repo_map()
+        system = system_prompt(self.workspace, self.execution, self.prompt_sections, planning=PLAN_TOOL in self.tools,
+                               repo_map=repo_map is not None, compaction=self.settings.context_compact_tokens > 0)
+        state.messages = [SystemMessage(system), UserMessage(task_message(self.workspace, task, repo_map))]
         specs = [t.spec() for t in self.tools.values()]
         while state.turn < self.settings.max_turns:
             if self.cancel.is_set():
                 return self._finish(Status.CANCELLED, "已停止")
             state.turn += 1
+            self._compact(state)
             t0 = time.monotonic()
             try:
-                resp = self._complete(state.messages, specs)
+                resp = self._complete(self._compactor.view(state.messages), specs)
             except LLMCancelled:
                 return self._finish(Status.CANCELLED, "已停止（正在进行的模型调用被放弃）")
             except LLMUnavailable as e:
                 self.trace.emit("llm_error", turn=state.turn, error=str(e))
                 return self._finish(Status.ERROR, str(e))
+            self._compactor.observe(resp.usage.prompt_tokens, len(state.messages))
+            self._record_server_compaction(state, resp.server_compaction)
             self._record_llm_call(state.turn, resp, time.monotonic() - t0)
             state.messages.append(resp.to_message())
 
@@ -172,6 +189,44 @@ class Agent:
             state.fix_rounds += 1
             state.messages.append(UserMessage(feedback))
         return self._finish(Status.MAX_TURNS, None)
+
+    def _record(self, event: str, **data: Any) -> None:
+        """工具往轨迹里记事件用：带上当前是第几轮。"""
+        self.trace.emit(event, turn=self._state.turn if self._state else 0, **data)
+
+    def _repo_map(self) -> str | None:
+        """生成代码库地图。这只是省几次 list_dir 的优化，出了问题照样往下跑，原因记在轨迹里。"""
+        if self.settings.repo_map_chars <= 0:
+            return None
+        try:
+            built = build_repo_map(self.workspace, self.settings.repo_map_chars)
+        except Exception as e:
+            self.trace.emit("repo_map", error=f"{type(e).__name__}: {e}")
+            return None
+        if built is None:
+            return None
+        self.trace.emit("repo_map", files=built.files, symbols=built.symbols, chars=len(built.text),
+                        detail=built.detail, complete=built.complete, seconds=built.seconds, text=built.text)
+        return built.text
+
+    def _compact(self, state: _State) -> None:
+        done = self._compactor.compact(state.messages)
+        if done is not None:
+            self.trace.emit("context_compact", turn=state.turn, source="client", before_tokens=done.before_tokens,
+                            after_tokens=done.after_tokens, cleared_results=done.cleared_results,
+                            cleared_chars=done.cleared_chars, cleared_tokens=done.before_tokens - done.after_tokens,
+                            threshold=self._compactor.threshold)
+
+    def _record_server_compaction(self, state: _State, seen: ServerCompaction | None) -> None:
+        """请求里永远是完整的历史，服务器每次都重新清理一遍、报告的是累计数：只有清理的范围变大了才算一次新的压缩。"""
+        before = state.server_cleared
+        if seen is None or seen.cleared_results <= before.cleared_results:
+            return
+        state.server_cleared = seen
+        self.trace.emit("context_compact", turn=state.turn, source="server",
+                        cleared_results=seen.cleared_results - before.cleared_results,
+                        cleared_tokens=max(seen.cleared_tokens - before.cleared_tokens, 0),
+                        threshold=self.settings.context_compact_tokens)
 
     def _complete(self, messages: Sequence[Message], specs: Sequence[ToolSpec]) -> LLMResponse:
         """在单独的线程里调模型，按了停止就不再等它，抛 LLMCancelled。

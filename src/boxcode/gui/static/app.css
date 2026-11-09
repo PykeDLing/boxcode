@@ -298,7 +298,7 @@ textarea.input { resize: vertical; line-height: 1.5; }
 .run-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 12px; }
 .run-meta .mono { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
 
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 10px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 10px; }
 .tile {
   padding: 10px 12px;
   border: 1px solid var(--border);
@@ -318,6 +318,24 @@ textarea.input { resize: vertical; line-height: 1.5; }
   background: var(--surface);
 }
 .final.is-error { border-color: transparent; background: var(--critical-bg); }
+
+.plan-panel { display: flex; flex-direction: column; gap: 8px; }
+.plan {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  list-style: none;
+}
+.plan-step { display: flex; align-items: baseline; gap: 8px; overflow-wrap: anywhere; }
+.plan-icon { flex: none; width: 14px; color: var(--muted); text-align: center; }
+.plan-step.completed { color: var(--ink-2); }
+.plan-step.completed .plan-icon { color: var(--good-ink); }
+.plan-step.in_progress { font-weight: 600; }
+.plan-step.in_progress .plan-icon { color: var(--accent); }
 .final-title { font-size: 12.5px; font-weight: 600; color: var(--ink-2); margin-bottom: 6px; }
 .final-body { white-space: pre-wrap; overflow-wrap: anywhere; }
 .final-body code { padding: 0 4px; border-radius: 4px; background: var(--code-bg); }

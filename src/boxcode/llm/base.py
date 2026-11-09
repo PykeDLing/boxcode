@@ -34,6 +34,14 @@ class Usage:
     cached_tokens: int = 0  # 其中命中提示缓存的部分
 
 
+@dataclass(frozen=True)
+class ServerCompaction:
+    """这一次请求里服务器清理掉的旧工具结果（见 Claude 的 context editing）。"""
+
+    cleared_results: int
+    cleared_tokens: int
+
+
 class StopReason(StrEnum):
     END = "end"  # 正常结束：回答完了，或者要调用工具
     MAX_TOKENS = "max_tokens"  # 撞上输出上限：工具参数可能被截断
@@ -85,6 +93,7 @@ class LLMResponse:
     usage: Usage = field(default_factory=Usage)
     stop_reason: StopReason = StopReason.END
     native: Native | None = None
+    server_compaction: ServerCompaction | None = None
 
     @property
     def truncated(self) -> bool:
@@ -109,6 +118,14 @@ class LLMProvider(Protocol):
         Provider（例如不用流式的接口）可以忽略 cancel，请求会在后台自己结束，结果被丢掉。
         """
         ...
+
+
+def clears_tool_results(llm: LLMProvider) -> bool:
+    """Provider 自己在服务器端清理旧的工具结果时返回 True，主循环就不再动发出去的历史。
+
+    不是 Protocol 的成员：只有 Claude 需要，其他 Provider 不用声明。
+    """
+    return getattr(llm, "clears_tool_results", False) is True
 
 
 class LLMUnavailable(RuntimeError):

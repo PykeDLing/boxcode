@@ -33,6 +33,9 @@ ENV_VARS: dict[str, str] = {
     "max_fix_rounds": "BOXCODE_MAX_FIX_ROUNDS",
     "command_timeout_s": "BOXCODE_COMMAND_TIMEOUT",
     "max_tool_output": "BOXCODE_MAX_TOOL_OUTPUT",
+    "context_compact_tokens": "BOXCODE_CONTEXT_COMPACT_TOKENS",
+    "repo_map_chars": "BOXCODE_REPO_MAP_CHARS",
+    "planning": "BOXCODE_PLANNING",
 }
 
 
@@ -61,6 +64,12 @@ class Settings(BaseModel):
     command_timeout_s: int = Field(default=120, ge=1)
     # 工具结果回给模型前截断到这么多字符，防止上下文被一次输出撑爆
     max_tool_output: int = Field(default=12000, ge=1000)
+    # 对话估算超过这么多 token 时清理旧的工具结果，0 表示不压缩（对比实验用）
+    context_compact_tokens: int = Field(default=40000, ge=0)
+    # 第一条消息里代码库地图的长度上限，0 表示不生成
+    repo_map_chars: int = Field(default=8000, ge=0)
+    # 是否给模型 update_plan 工具
+    planning: bool = True
 
     @model_validator(mode="before")
     @classmethod

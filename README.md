@@ -108,6 +108,9 @@ uv run boxcode gui
 | `BOXCODE_MAX_FIX_ROUNDS` | `2` | 自检失败后最多再修几轮 |
 | `BOXCODE_COMMAND_TIMEOUT` | `120` | 单条命令的超时（秒） |
 | `BOXCODE_MAX_TOOL_OUTPUT` | `12000` | 每个工具结果回给模型前最多保留的字符数 |
+| `BOXCODE_CONTEXT_COMPACT_TOKENS` | `40000` | 上下文估算超过这么多 token 时清理旧的工具结果，`0` 表示不压缩 |
+| `BOXCODE_REPO_MAP_CHARS` | `8000` | 开头给模型的代码库地图的长度上限，`0` 表示不生成 |
+| `BOXCODE_PLANNING` | `true` | 是否给模型 `update_plan` 工具 |
 | `BOXCODE_HOME` | `~/.boxcode` | 执行轨迹存放位置 |
 
 值写错了（例如 `BOXCODE_MAX_TURNS=abc`、不认识的 `BOXCODE_PROVIDER`）启动时就会报出是哪个变量，退出码 2。

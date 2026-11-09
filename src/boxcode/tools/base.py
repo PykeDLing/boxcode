@@ -6,11 +6,11 @@ import os
 import stat
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import BinaryIO, ClassVar
+from typing import Any, BinaryIO, ClassVar
 
 from pydantic import BaseModel, ConfigDict
 
@@ -30,6 +30,10 @@ class ToolError(Exception):
     """工具执行失败，原因会作为工具结果回给模型，让它自己调整。"""
 
 
+def _discard_event(event: str, **data: Any) -> None:
+    pass
+
+
 @dataclass(frozen=True)
 class ToolContext:
     workspace: Path
@@ -37,6 +41,8 @@ class ToolContext:
     settings: Settings
     # 被设置后，正在执行的命令会被杀掉（界面上按了“停止”）
     cancel: threading.Event = field(default_factory=threading.Event)
+    # 往这次运行的轨迹里记一条事件（例如计划的变化）
+    record: Callable[..., None] = _discard_event
 
 
 @dataclass(frozen=True)

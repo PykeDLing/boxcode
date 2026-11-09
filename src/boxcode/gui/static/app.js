@@ -20,6 +20,7 @@ const STATUS = {
   crashed: { label: "崩溃", tone: "critical", icon: "✕" },
   unfinished: { label: "未结束", tone: "muted", icon: "○" },
 };
+const PLAN_ICONS = { pending: "○", in_progress: "●", completed: "✓" };
 const CATEGORY = { bugfix: "修 bug", feature: "实现功能", injection: "注入" };
 const DECISION = {
   allow: { label: "放行", tone: "good" },
@@ -136,6 +137,8 @@ function summarize(events) {
   const sum = (arr, k) => arr.reduce((a, e) => a + (e[k] || 0), 0);
   return {
     llmCalls: llm.length,
+    context: llm.length ? llm[llm.length - 1].prompt_tokens : null,
+    compactions: events.filter((e) => e.event === "context_compact").length,
     prompt: sum(llm, "prompt_tokens"),
     completion: sum(llm, "completion_tokens"),
     cached: sum(llm, "cached_tokens"),
@@ -181,6 +184,27 @@ function timelineItem(e, t0) {
       title = [h("strong", { text: "开始运行" })];
       meta.push([e.model, lookup(MODE_LABELS, e.mode) || e.mode, `沙盒 ${e.sandbox === "seatbelt" ? "Seatbelt" : "未启用"}`,
         `网络${e.allow_network ? "开" : "关"}`].join(" · "));
+      break;
+    case "repo_map":
+      title = [h("strong", { text: e.error ? "代码库地图没有生成" : "代码库地图" })];
+      if (e.error) {
+        meta.push(e.error);
+        break;
+      }
+      meta.push(`${fmtInt(e.files)} 个文件 · ${fmtInt(e.symbols)} 个符号 · ${fmtInt(e.chars)} 字符 · ${fmtSec(e.seconds)}`);
+      if (e.detail >= 2) meta.push("仓库太大，只列了文件路径");
+      if (e.complete === false) meta.push("文件太多，没有看完整个仓库");
+      detail = h("details", null, h("summary", { text: "内容" }), h("div", { class: "tl-detail" }, pre(e.text)));
+      break;
+    case "context_compact":
+      dot = "warning";
+      title = [h("strong", { text: "压缩上下文" }), chip(`阈值 ${fmtInt(e.threshold)}`)];
+      if (e.source === "server") meta.push(`服务器清理了 ${fmtInt(e.cleared_results)} 次旧的工具调用结果，省下 ${fmtInt(e.cleared_tokens)} token`);
+      else meta.push(`清理 ${fmtInt(e.cleared_results)} 个旧的工具结果，省下 ${fmtInt(e.cleared_chars)} 字符 · 估算 ${fmtInt(e.before_tokens)} → ${fmtInt(e.after_tokens)} token`);
+      break;
+    case "plan_update":
+      dot = "accent";
+      title = [h("strong", { text: "更新计划" }), chip(`${e.completed} / ${e.total}`)];
       break;
     case "llm_call": {
       dot = "accent";
@@ -251,9 +275,10 @@ class RunView {
     this.tiles = h("div", { class: "tiles" });
     this.approvals = h("div", { class: "approvals" });
     this.final = h("div", { class: "final", hidden: true });
+    this.plan = h("div", { class: "plan-panel", hidden: true });
     this.timeline = h("ol", { class: "timeline" });
     this.el = h("div", { class: "run-view" },
-      this.approvals, this.head, this.tiles, this.final,
+      this.approvals, this.head, this.tiles, this.final, this.plan,
       h("h3", { class: "section-title", text: "执行过程" }), this.timeline);
     this.events = [];
     this.live = false;
@@ -273,7 +298,8 @@ class RunView {
   add(e, refresh = true) {
     const nearBottom = this.scroller.scrollHeight - this.scroller.scrollTop - this.scroller.clientHeight < 120;
     this.events.push(e);
-    this.timeline.append(timelineItem(e, this.events[0].ts));
+    // 成功的 update_plan 由紧挨着的 plan_update 显示，时间线上不用出现两条；出错的要留着，看得到原因
+    if (!(e.event === "tool_call" && e.tool === "update_plan" && e.ok)) this.timeline.append(timelineItem(e, this.events[0].ts));
     if (e.event === "run_end") this.live = false;
     if (refresh) {
       this.refresh();
@@ -307,9 +333,23 @@ class RunView {
     this.tiles.replaceChildren(
       tile("模型调用", fmtInt(s.llmCalls)),
       tile("工具调用", fmtInt(s.toolCalls), `拒绝 ${s.denied} · 出错 ${s.failed}`),
+      tile("当前上下文", fmtInt(s.context), s.compactions ? `压缩 ${s.compactions} 次` : "未压缩"),
       tile("输入 token", fmtInt(s.prompt), s.prompt ? `命中缓存 ${fmtPct(s.cached / s.prompt)}` : null),
       tile("输出 token", fmtInt(s.completion)),
       tile("耗时", fmtSec(s.seconds)));
+
+    const plan = [...this.events].reverse().find((e) => e.event === "plan_update");
+    const steps = plan && Array.isArray(plan.steps) ? plan.steps : [];
+    this.plan.hidden = !steps.length;
+    this.plan.replaceChildren(...(steps.length ? [
+      h("h3", { class: "section-title", text: `任务计划（${plan.completed} / ${plan.total}）` }),
+      h("ol", { class: "plan" }, steps.map((step) => {
+        const known = Object.hasOwn(PLAN_ICONS, step.status) ? step.status : "pending";
+        return h("li", { class: `plan-step ${known}` },
+          h("span", { class: "plan-icon", "aria-hidden": "true", text: PLAN_ICONS[known] }),
+          h("span", { text: step.step }));
+      })),
+    ] : []));
 
     const text = end ? end.final_message || end.error : null;
     this.final.hidden = !text;

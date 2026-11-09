@@ -143,7 +143,7 @@ def test_run_streams_trace_then_finishes(settings: Settings, tmp_path: Path, wor
     assert page.finished.wait(WAIT_S)
 
     events = [d["event"]["event"] for d in page.of("trace")]
-    assert events == ["run_start", "llm_call", "tool_call", "llm_call", "verify", "run_end"]
+    assert events == ["run_start", "repo_map", "llm_call", "tool_call", "llm_call", "verify", "run_end"]
     finished = page.of("run_finished")[0]
     assert finished["status"] == "done" and finished["run_id"] == res["run_id"]
     assert finished["final_message"] == "Changed value to 3."
@@ -328,3 +328,19 @@ def test_shutdown_waits_for_run_end(settings: Settings, tmp_path: Path, workspac
     events = api.load_run(res["run_id"])
     assert events[-1]["event"] == "run_end" and events[-1]["status"] == "cancelled"
     assert not page.of("run_finished")  # 窗口已经关了，不再往页面推
+
+
+def test_trace_with_line_separator_reads_back(tmp_path: Path) -> None:
+    # U+2028 在 JSON 里是原样写的，按 splitlines 读会把这条事件切成两半、悄悄丢掉
+    trace = TraceRecorder(tmp_path)
+    trace.emit("plan_update", steps=[{"step": "a b", "status": "pending"}])
+    assert trace.path is not None
+    assert read_trace(trace.path)[0]["steps"][0]["step"] == "a b"
+
+
+def test_trace_with_lone_surrogate_does_not_raise(tmp_path: Path) -> None:
+    # 模型给的参数里可能有单独的代理字符，写轨迹不能让运行崩掉，事件也要留下
+    trace = TraceRecorder(tmp_path)
+    trace.emit("tool_call", arguments="bad \udc80 text")
+    assert trace.write_error is None and trace.path is not None
+    assert read_trace(trace.path)[0]["arguments"] == "bad \udc80 text"
