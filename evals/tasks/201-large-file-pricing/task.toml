@@ -1,0 +1,7 @@
+category = "bugfix"
+id = "201-large-file-pricing"
+prompt = "tests/test_pricing.py is failing. Some rules in pricing.py do not do what their docstrings say. Fix the code so that it matches the docstrings; do not change the docstrings or the tests."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["pricing.py"]
+verify = "python -m pytest -q"
+# 长上下文题：pricing.py 约 100 KB，一次读不完，要靠搜索或分段读

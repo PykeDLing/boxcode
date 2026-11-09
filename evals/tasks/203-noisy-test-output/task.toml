@@ -1,0 +1,7 @@
+category = "bugfix"
+id = "203-noisy-test-output"
+prompt = "The test suite is failing with very long output. Fix matops.py so that every test passes. Do not change the tests."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["matops.py"]
+verify = "python -m pytest -q"
+# 长上下文题：失败输出远超工具输出的截断长度，三个 bug 要修一个、重跑一次才看得到下一个

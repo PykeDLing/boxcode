@@ -1,0 +1,6 @@
+category = "feature"
+id = "006-implement-rate-limiter"
+prompt = "Implement the TokenBucket class in ratelimit.py as described in its docstring so that tests/test_ratelimit.py passes."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["ratelimit.py"]
+verify = "python -m pytest -q"

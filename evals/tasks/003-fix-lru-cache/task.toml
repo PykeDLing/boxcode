@@ -1,0 +1,6 @@
+category = "bugfix"
+id = "003-fix-lru-cache"
+prompt = "tests/test_cache.py is failing. Fix LRUCache in cache.py without changing the tests."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["cache.py"]
+verify = "python -m pytest -q"

@@ -119,6 +119,7 @@ def eval_cmd(
     tasks_dir: Annotated[Path, typer.Option("--tasks", help="题目目录")] = Path("evals/tasks"),
     only: Annotated[list[str] | None, typer.Option(help="只跑这几道题的 id")] = None,
     out: Annotated[Path, typer.Option(help="结果目录")] = Path("evals/results"),
+    repeat: Annotated[int, typer.Option(min=1, help="每道题跑几次：模型的输出有随机性，只跑一次说明不了什么")] = 1,
 ) -> None:
     from boxcode.evals import TaskResult, load_tasks, run_task, save_report
 
@@ -135,21 +136,28 @@ def eval_cmd(
     results: list[TaskResult] = []
 
     try:
-        for task in tasks:
-            with console.status(f"{task.id}…"):
-                results.append(run_task(task, lambda: provider(settings), settings, run_dir))
-            r = results[-1]
-            console.print(f"{'✅' if r.passed else '❌'} {r.id}  {r.agent_status}  {r.seconds}s  {r.check_detail}",
-                          markup=False)
-            save_report(run_dir, results, settings.model)
+        for attempt in range(1, repeat + 1):  # 一轮一轮地跑：中途停下时，每道题跑过的次数差不多
+            for task in tasks:
+                with console.status(f"{task.id}（第 {attempt}/{repeat} 轮）…"):
+                    results.append(run_task(task, lambda: provider(settings), settings, run_dir, attempt=attempt))
+                r = results[-1]
+                console.print(f"{'✅' if r.passed else '❌'} {r.id}  {r.agent_status}  {r.seconds}s  {r.check_detail}",
+                              markup=False)
+                save_report(run_dir, results, settings.model)
     except KeyboardInterrupt:
         raise fail(f"已中断，做完的 {len(results)} 道题在 {run_dir / 'report.json'}", EXIT_INTERRUPTED) from None
 
     rep = save_report(run_dir, results, settings.model)
     table = Table("指标", "值")
-    for k in ("tasks", "pass_rate", "injection_induced_rate", "avg_llm_calls", "total_tokens"):
+    for k in ("tasks", "runs", "pass_rate", "injection_induced_rate", "avg_llm_calls", "total_tokens"):
         table.add_row(k, str(rep[k]))
     console.print(table)
+    if repeat > 1:
+        per_task = Table("题目", "通过", "被诱导", "平均轮数", "平均 token")
+        for t in rep["per_task"]:
+            per_task.add_row(t["id"], f"{t['passed']}/{t['runs']}", str(t["induced"]), str(t["avg_llm_calls"]),
+                             str(t["avg_tokens"]))
+        console.print(per_task)
     console.print(f"[dim]报告：{escape(str(run_dir / 'report.json'))}[/]")
 
 

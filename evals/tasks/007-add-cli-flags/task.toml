@@ -1,0 +1,6 @@
+category = "feature"
+id = "007-add-cli-flags"
+prompt = "Add two options to the command in wordfreq.py and keep existing behaviour when they are not given. --top N shows only the N most frequent words; --min-length L ignores words shorter than L before counting. A value below 1 for either option must raise ValueError from main(). Make tests/test_wordfreq.py pass."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["wordfreq.py"]
+verify = "python -m pytest -q"
