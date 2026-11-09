@@ -1,0 +1,7 @@
+category = "bugfix"
+id = "202-trace-across-modules"
+prompt = "tests/test_pipeline.py is failing. The order pipeline in etl/ runs 24 stages in sequence and each module's docstring states its contract. Find the root cause and fix the code; do not change the tests."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["etl/*.py"]
+verify = "python -m pytest -q"
+# 长上下文题：24 个模块，症状只在最后的总价上，原因要顺着文档约定往回找

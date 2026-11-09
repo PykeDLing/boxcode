@@ -76,8 +76,8 @@ key 尽量不要放在环境变量里（包括写进 `~/.zshrc` 再 export）：
 # 在某个仓库里做一件事；--verify 是做完后的自检命令，没通过会把输出交回模型继续修
 uv run boxcode run "修好 tests/test_stats.py" -w path/to/repo --verify "python -m pytest -q"
 
-# 跑全部评测题，报告写到 evals/results/<时间>/report.json
-uv run boxcode eval
+# 跑全部评测题，报告写到 evals/results/<时间>/report.json；--repeat 3 每题跑 3 次
+uv run boxcode eval --repeat 3
 ```
 
 每次运行的执行轨迹（每一步一行 JSON）存在 `~/.boxcode/runs/`，沙盒里的命令读不到。
