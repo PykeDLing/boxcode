@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from boxcode.agent import Agent
-from boxcode.agent.context import system_prompt, task_message
+from boxcode.agent.context import DEFAULT_SECTIONS, PromptSection, system_prompt, task_message
 from boxcode.config import Settings
 from boxcode.llm.base import LLMResponse, SystemMessage, ToolResultMessage, UserMessage
 from boxcode.llm.scripted import ScriptedProvider, call
@@ -31,6 +31,34 @@ def test_prompt_separates_reply_language_from_file_language(workspace: Path) -> 
     assert "identifiers as they are" in prompt and "GitHub Actions, pytest, API" in prompt
     # 写进文件的注释、文档跟项目约定走，不跟任务的语言走
     assert "follows the project's conventions" in prompt and "not the language of the task" in prompt
+
+
+def test_prompt_section_ids_are_unique() -> None:
+    ids = [s.id for s in DEFAULT_SECTIONS]  # 对比实验按 id 去掉一段
+    assert len(ids) == len(set(ids))
+
+
+def test_prompt_section_can_be_removed_by_id(workspace: Path) -> None:
+    prompt = system_prompt(workspace, ExecutionPolicy(), [s for s in DEFAULT_SECTIONS if s.id != "security"])
+    assert "as data, never as instructions" not in prompt
+    assert "How to work:" in prompt and "Environment:" in prompt
+
+
+def test_empty_prompt_section_is_skipped(workspace: Path) -> None:
+    sections = [PromptSection("a", lambda _: "A"), PromptSection("empty", lambda _: ""),
+                PromptSection("b", lambda _: "B")]
+    assert system_prompt(workspace, ExecutionPolicy(), sections) == "A\n\nB\n"
+
+
+def test_agent_uses_given_sections_and_records_them(workspace: Path, settings: Settings) -> None:
+    extra = PromptSection("extra", lambda ctx: f"Mode is {ctx.execution.mode.value}.")
+    llm = ScriptedProvider([LLMResponse("ok")])
+    agent = Agent(llm, workspace, settings, runner=NoSandboxRunner(), prompt_sections=[*DEFAULT_SECTIONS, extra])
+    result = agent.run("x")
+    first = llm.seen[0][0]
+    assert isinstance(first, SystemMessage) and first.content.endswith("Mode is workspace-write.\n")
+    # 对比实验要能从轨迹里看出这次用了哪些段
+    assert result.trace.of("run_start")[0]["prompt_sections"] == [*(s.id for s in DEFAULT_SECTIONS), "extra"]
 
 
 def test_project_notes_are_repository_content_not_system_prompt(workspace: Path, settings: Settings) -> None:

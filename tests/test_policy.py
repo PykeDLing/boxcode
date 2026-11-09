@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from boxcode.policy import Action, ApprovalMode, ExecutionPolicy, Policy, UnsafeWorkspace, check_workspace
+from boxcode.policy import Action, ApprovalMode, Decision, ExecutionPolicy, Policy, UnsafeWorkspace, check_workspace
 from boxcode.sandbox import NoSandboxRunner, SeatbeltRunner
 from boxcode.tools.base import Risk, Target
 
@@ -11,6 +11,16 @@ from boxcode.tools.base import Risk, Target
 @pytest.fixture
 def policy(workspace: Path) -> Policy:
     return Policy(ApprovalMode.WORKSPACE_WRITE, workspace)
+
+
+@pytest.mark.parametrize(("current", "other", "expected"), [
+    (Action.ALLOW, Action.ALLOW, "current"), (Action.ALLOW, Action.ASK, "other"), (Action.ALLOW, Action.DENY, "other"),
+    (Action.ASK, Action.ALLOW, "current"), (Action.ASK, Action.ASK, "current"), (Action.ASK, Action.DENY, "other"),
+    (Action.DENY, Action.ALLOW, "current"), (Action.DENY, Action.ASK, "current"), (Action.DENY, Action.DENY, "current"),
+])
+def test_decision_only_gets_stricter(current: Action, other: Action, expected: str) -> None:
+    # 工具钩子靠这一条才放不宽权限
+    assert Decision(current, "current").tightened_by(Decision(other, "other")).reason == expected
 
 
 def test_read_always_allowed(policy: Policy) -> None:
