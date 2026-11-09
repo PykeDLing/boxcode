@@ -73,7 +73,7 @@ class Tool[P: ToolParams](ABC):
         return self.Params.model_validate_json(arguments or "{}")
 
     def target(self, ctx: ToolContext, params: P) -> Target:
-        """会写文件、执行命令的工具要覆盖它，权限策略按这里返回的东西判断。"""
+        """会写文件、执行命令的工具要覆盖它，权限策略按这里返回的东西判断。不覆盖的话每次调用都要问人。"""
         return Target()
 
     @abstractmethod

@@ -121,6 +121,11 @@ RISKY_COMMANDS: tuple[tuple[re.Pattern[str], str], ...] = tuple((re.compile(p), 
 ))
 
 
+# 工具没说会碰到什么（忘了覆盖 target()，或者外部工具根本没有命令可看），策略判断不了，就不能放行，
+# “在沙盒中执行”这个理由也不一定成立。所以 full-auto 也要问
+UNDECLARED_TARGET = "工具没有声明会写哪里、执行什么，无法判断风险"
+
+
 class Policy:
     def __init__(self, mode: ApprovalMode, workspace: Path) -> None:
         self.mode = mode
@@ -133,6 +138,8 @@ class Policy:
         if risk is Risk.WRITE:
             if self.mode is ApprovalMode.READ_ONLY:
                 return Decision(Action.DENY, "只读模式不能写文件")
+            if not target.paths:
+                return Decision(Action.ASK, UNDECLARED_TARGET)
             for p in target.paths:
                 rel = p.relative_to(self.workspace)
                 if any(part.casefold() == PROTECTED_DIR for part in rel.parts):
@@ -140,7 +147,9 @@ class Policy:
             return Decision(Action.ALLOW, "写工作区内的文件")
 
         # Risk.EXEC
-        command = target.command or ""
+        command = target.command
+        if command is None:
+            return Decision(Action.ASK, UNDECLARED_TARGET)
         if self.mode is ApprovalMode.FULL_AUTO:
             return Decision(Action.ALLOW, "full-auto 模式，在沙盒中执行")
         if self.mode is ApprovalMode.READ_ONLY:

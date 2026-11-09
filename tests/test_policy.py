@@ -99,6 +99,30 @@ def test_full_auto_allows_risky(workspace: Path) -> None:
     assert p.check(Risk.EXEC, Target(command="curl x")).action is Action.ALLOW
 
 
+@pytest.mark.parametrize("mode", [ApprovalMode.WORKSPACE_WRITE, ApprovalMode.FULL_AUTO])
+@pytest.mark.parametrize("risk", [Risk.WRITE, Risk.EXEC])
+def test_undeclared_target_asks(workspace: Path, mode: ApprovalMode, risk: Risk) -> None:
+    # 工具忘了覆盖 target()、外部工具没有命令可看：以前直接放行，理由还写着“在沙盒中执行”
+    decision = Policy(mode, workspace).check(risk, Target())
+    assert decision.action is Action.ASK and "没有声明" in decision.reason
+
+
+def test_undeclared_target_in_read_only(workspace: Path) -> None:
+    p = Policy(ApprovalMode.READ_ONLY, workspace)
+    assert p.check(Risk.WRITE, Target()).action is Action.DENY  # 只读模式的拒绝比“问一下”更严，不能被放宽
+    assert p.check(Risk.EXEC, Target()).action is Action.ASK
+
+
+def test_exec_with_only_paths_is_undeclared(policy: Policy, workspace: Path) -> None:
+    # 策略看的是命令：只给了路径，还是不知道要执行什么
+    assert policy.check(Risk.EXEC, Target(paths=(workspace / "a.py",))).action is Action.ASK
+
+
+def test_empty_command_is_declared(policy: Policy) -> None:
+    # 模型给了空命令也是声明过的：它照常进沙盒，不算“不知道要执行什么”
+    assert policy.check(Risk.EXEC, Target(command="")).action is Action.ALLOW
+
+
 @pytest.mark.parametrize("rel", [
     "", "Library/LaunchAgents", ".ssh", ".aws", ".boxcode", ".boxcode/runs",
     # 本身沙盒照常能读，但里面的配置、程序之后会在沙盒外执行；或者包含了凭证目录
