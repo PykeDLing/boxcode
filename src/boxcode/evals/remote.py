@@ -14,7 +14,8 @@
 - 异常按类型和参数重建：内置异常还是原来的类，被测代码自己定义的异常类在测试进程里有一个对应的子类
   （继承它最近的内置异常基类），所以 pytest.raises(ValueError) 和 pytest.raises(stats.WindowError) 都照常能用
 
-测试进程不信任对面发来的任何东西：只解析 JSON，不执行对面给的代码；对面能请求的只有调用测试交过去的对象和几种运算，
+测试进程不信任对面发来的任何东西：只解析 JSON，不执行对面给的代码；对面能请求的只有对测试交过去的对象做调用和几种运算，
+内置类型不能当操作目标（`type(名字, 基类, 属性)` 能在测试进程里造出一个 `__eq__` 由被测代码决定的真对象），
 取不了测试进程里对象的属性（取得到的话顺着 `f.__globals__` 就能拿到 os 模块）。被测代码里抛出的 SystemExit、
 KeyboardInterrupt 这类不是 Exception 的异常，传回来一律变成 RemoteError，不会让 pytest 退出。
 
@@ -22,7 +23,7 @@ KeyboardInterrupt 这类不是 Exception 的异常，传回来一律变成 Remot
 `__eq__` 判断，按“类型不同”处理。否则返回一个 `__eq__` 总是 True 的对象，就能让所有 `assert f(x) == 期望值` 通过。
 int、str、tuple 这些类型的子类（IntEnum、namedtuple、numpy 的 float64）会顺带传一份普通数据的拷贝，
 和测试进程里的东西比较时用这份拷贝、在测试进程里算。两边都是被测进程里的对象时（`Point(1, 2) == Point(1, 2)`），
-才交给被测代码自己判断。
+才交给被测代码自己判断。`in` 也一样：有拷贝的按拷贝算；没有拷贝的自定义类，它的 `__contains__` 本身就是被测的行为。
 
 不支持的：测试 monkeypatch 被测模块（只改得到测试进程里的代理）；被测代码在别的线程里回调测试交过去的函数；
 被测代码返回的对象和测试自己（不是 editable 的模块里）构造的对象在两个进程里，不会相等。
@@ -97,6 +98,8 @@ OPS: dict[str, Callable[..., Any]] = {
     "isinstance": isinstance, "issubclass": issubclass, "enter": lambda obj: type(obj).__enter__(obj), "exit": _exit,
     **_ARITHMETIC, **_COMPARISONS,
 }
+# 这些运算里代理可能在第二个位置（`1 + 代理`、`isinstance(x, 代理)`），其余的操作目标都是第一个参数
+_EITHER_OPERAND = frozenset({*_ARITHMETIC, "isinstance", "issubclass"})
 
 
 def _import(name: str, paths: list[str]) -> types.ModuleType:
@@ -150,10 +153,13 @@ class Channel:
     所以同一个函数取两次是同一个代理，`is` 照常能用。
     """
 
-    def __init__(self, rfd: int, wfd: int, ops: dict[str, Callable[..., Any]], *, tracebacks: bool) -> None:
+    def __init__(
+        self, rfd: int, wfd: int, ops: dict[str, Callable[..., Any]], *, tracebacks: bool, exports_only: bool,
+    ) -> None:
         self._rfd, self._wfd = rfd, wfd
         self._ops = ops
         self._tracebacks = tracebacks  # 被测进程把调用栈附在异常里，测试失败时看得到是哪一行
+        self._exports_only = exports_only  # 测试进程：对面只能操作这边交过去的对象
         self._lock = threading.RLock()
         self._request_ids = itertools.count(1)
         self._export_ids = itertools.count(1)
@@ -244,6 +250,8 @@ class Channel:
             kwargs = self.decode(msg.get("kwargs", {}))
             if not (isinstance(args, list) and isinstance(kwargs, dict) and all(isinstance(k, str) for k in kwargs)):
                 raise TypeError("请求的参数格式不对")
+            if self._exports_only and not self._targets_export(op, args):
+                raise TypeError(f"对面只能对这边交过去的对象做 {op!r}")
             reply: dict[str, Any] = {"id": msg["id"], "ok": self.encode(self._ops[op](*args, **kwargs))}
         except BaseException as e:  # 包括被测代码抛出的 SystemExit、KeyboardInterrupt：变成错误回复，进程接着服务
             reply = {"id": msg["id"], "error": self._encode_error(e)}
@@ -251,6 +259,11 @@ class Channel:
             self._send(reply)
         except (RemoteError, ValueError, TypeError, RecursionError) as e:  # 结果传不过去（太大、循环引用）
             self._send({"id": msg["id"], "error": self._encode_error(RemoteError(f"结果传不回去：{e}"))})
+
+    def _targets_export(self, op: str, args: list[Any]) -> bool:
+        """操作目标是不是这边交给过对面的。内置类型按名字传，从来不算：`type` 调用不了，`type["x"]` 的别名也拿不到。"""
+        targets = args[:2] if op in _EITHER_OPERAND else args[:1]
+        return any(id(target) in self._exported for target in targets)  # _exports 拿着对象，id 不会被别的对象重用
 
     # ---- 编码 ----
 
@@ -480,6 +493,9 @@ class Remote:
         return self._boxcode("reversed", self)
 
     def __contains__(self, item: Any) -> bool:
+        value = object.__getattribute__(self, "_boxcode_value")
+        if value is not _MISSING:  # 和比较一样：str、list 这些的子类按普通数据的拷贝算，不交给被测代码
+            return item in value
         return self._boxcode("contains", self, item)  # type: ignore[no-any-return]
 
     def __getitem__(self, key: Any) -> Any:
@@ -614,7 +630,7 @@ def install_from_env() -> Channel | None:
     fds = os.environ.get(TESTER_FDS_ENV)
     if not fds:
         return None
-    channel = Channel(*_fds(fds), OPS, tracebacks=False)
+    channel = Channel(*_fds(fds), OPS, tracebacks=False, exports_only=True)
     root = Path(os.environ[CHECK_DIR_ENV]).resolve()
     editable = json.loads(os.environ[EDITABLE_ENV])
     sys.meta_path.insert(0, _RemoteFinder(channel, root, [str(p) for p in editable]))
@@ -625,7 +641,7 @@ def main() -> None:
     """被测进程：python -I -B -c "from boxcode.evals.remote import main; main()" <判分目录>。"""
     root = sys.argv[1]
     sys.path.insert(0, root)
-    channel = Channel(*_fds(os.environ.pop(WORKER_FDS_ENV)), WORKER_OPS, tracebacks=True)
+    channel = Channel(*_fds(os.environ.pop(WORKER_FDS_ENV)), WORKER_OPS, tracebacks=True, exports_only=False)
     try:
         channel.serve()
     finally:

@@ -35,9 +35,10 @@ def connect(tmp_path: Path) -> Iterator[Connect]:
         worker_r, tester_w = os.pipe()
         fds.extend([tester_r, tester_w, worker_r, worker_w])
         names.append(name)
-        worker = Channel(worker_r, worker_w, WORKER_OPS, tracebacks=True)
+        worker = Channel(worker_r, worker_w, WORKER_OPS, tracebacks=True, exports_only=False)
         threading.Thread(target=worker.serve, daemon=True).start()
-        return Channel(tester_r, tester_w, OPS, tracebacks=False).request("import", name, [str(tmp_path)])
+        tester = Channel(tester_r, tester_w, OPS, tracebacks=False, exports_only=True)
+        return tester.request("import", name, [str(tmp_path)])
 
     yield make
     for fd in fds:  # 先关掉测试进程那端，被测进程的 serve 读到 EOF 就退出
@@ -118,6 +119,68 @@ def test_tested_code_cannot_reach_into_test_process(connect: Connect) -> None:
         mod.peek(lambda: None)
 
 
+REQUEST_FROM_WORKER = """import sys
+
+def channel():  # 被测代码什么都拿得到，包括自己进程里连接的这一端
+    frame = sys._getframe()
+    while frame.f_code.co_name != "_handle":
+        frame = frame.f_back
+    return frame.f_locals["self"]
+
+def make_class():
+    return channel().request("call", type, "X", (object,), {})
+
+def make_alias():
+    return channel().request("getitem", type, "x")
+
+def build(cls):
+    return channel().request("call", cls, "3")
+
+def add_one(x):
+    return 1 + x
+
+def is_a(obj, cls):
+    return isinstance(obj, cls)
+"""
+
+
+def test_builtin_types_cannot_be_operated_in_test_process(connect: Connect) -> None:
+    # 让测试进程执行 type(...) 能造出 __eq__ 由被测代码决定的真对象；type["x"] 的别名调用起来也是 type(...)
+    mod = connect(REQUEST_FROM_WORKER)
+    for attack in (mod.make_class, mod.make_alias, lambda: mod.build(int)):
+        with pytest.raises(TypeError, match="只能对这边交过去的对象"):
+            attack()
+
+
+def test_objects_passed_by_tests_still_work_from_tested_code(connect: Connect) -> None:
+    # 限制的是操作目标：测试交过去的回调、类和反向运算要照常能用
+    class Money:
+        def __radd__(self, other: int) -> int:
+            return other + 41
+
+    class Plain:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    mod = connect(REQUEST_FROM_WORKER)
+    assert mod.add_one(Money()) == 42
+    assert mod.is_a(Money(), Money) is True and mod.is_a(5, Money) is False
+    assert isinstance(mod.build(Plain), Plain) and mod.build(Plain).text == "3"
+
+
+def test_contains_uses_the_plain_copy(connect: Connect) -> None:
+    mod = connect(
+        "class Liar(str):\n    def __contains__(self, item):\n        return True\n"
+        "class LiarList(list):\n    def __contains__(self, item):\n        return True\n"
+        "class Bag:\n    def __contains__(self, item):\n        return item == 1\n"
+        "def liar():\n    return Liar('real text')\n"
+        "def liar_list():\n    return LiarList([1])\n"
+    )
+    assert "needle" not in mod.liar() and "real" in mod.liar()
+    assert 2 not in mod.liar_list() and 1 in mod.liar_list()
+    assert 1 in mod.Bag() and 2 not in mod.Bag()  # 没有拷贝的自定义类：__contains__ 就是被测的行为
+
+
 def test_non_exception_errors_do_not_stop_pytest(connect: Connect) -> None:
     mod = connect("import sys\ndef bye():\n    sys.exit(0)\ndef ctrl_c():\n    raise KeyboardInterrupt\n")
     with pytest.raises(RemoteError, match="SystemExit"):
@@ -145,7 +208,7 @@ def _fake_worker(reply: bytes | None) -> Channel:
         os.close(worker_r)
 
     threading.Thread(target=serve, daemon=True).start()
-    return Channel(tester_r, tester_w, OPS, tracebacks=False)
+    return Channel(tester_r, tester_w, OPS, tracebacks=False, exports_only=True)
 
 
 @pytest.mark.parametrize(("reply", "error"), [
