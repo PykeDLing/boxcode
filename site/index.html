@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BoxCode · 把 Agent 的命令关进盒子里</title>
+  <meta name="description" content="BoxCode 是一个命令行编程 Agent：读代码、改代码、跑测试，失败了自己修。它执行的每条命令都关在 macOS Seatbelt 沙盒里。">
+  <link rel="icon" href="media/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#main">跳到正文</a>
+
+  <header class="nav">
+    <a class="brand" href="#top" aria-label="BoxCode 首页">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="3" y="3" width="26" height="26" rx="5" fill="none" stroke="currentColor" stroke-width="2.6"/>
+        <path d="M10 12l5 4-5 4" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M17.5 21h5" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/>
+      </svg>
+      <span>BoxCode</span>
+    </a>
+    <nav class="nav-links" aria-label="页面导航">
+      <a href="#sandbox">沙盒</a>
+      <a href="#how">工作原理</a>
+      <a href="#limits">使用须知</a>
+      <a href="#start">快速开始</a>
+    </nav>
+    <a class="nav-gh" href="https://github.com/PykeDLing/boxcode">GitHub <span aria-hidden="true">↗</span></a>
+  </header>
+
+  <main id="main">
+    <!-- 首屏 -->
+    <section class="hero" id="top">
+      <div class="hero-copy">
+        <p class="eyebrow">命令行编程 Agent · macOS</p>
+        <h1>把 Agent 的命令，<br>关进盒子里。</h1>
+        <p class="lede">
+          BoxCode 读代码、改代码、跑测试，失败了自己修。它执行的每条命令都关在 macOS Seatbelt 沙盒里：
+          只能写工作区，读不到凭证，默认断网。
+        </p>
+        <div class="cta">
+          <a class="btn btn-primary" href="#start">快速开始</a>
+          <a class="btn" href="https://github.com/PykeDLing/boxcode">在 GitHub 上查看 <span aria-hidden="true">↗</span></a>
+        </div>
+        <ul class="facts" aria-label="项目信息">
+          <li>Python 3.12</li>
+          <li>macOS Seatbelt</li>
+          <li>MIT 许可</li>
+          <li>451 个测试</li>
+        </ul>
+      </div>
+
+      <!-- 沙盒示意：盒子里的命令，和它够不着的东西 -->
+      <figure class="boxdemo" id="boxdemo">
+        <div class="box" data-state="idle">
+          <div class="box-head">
+            <span class="box-title">沙盒 · sandbox-exec</span>
+            <span class="box-path">工作区 ~/dev/my-repo</span>
+          </div>
+          <ol class="log" id="demo-log">
+            <li data-verdict="ok"><code>python -m pytest -q</code><span class="verdict">放行 · 在工作区里</span></li>
+            <li data-verdict="deny" data-target="cred"><code>cat ~/.ssh/id_rsa</code><span class="verdict">挡住 · 读不到凭证</span></li>
+            <li data-verdict="deny" data-target="net"><code>curl https://example.com/upload</code><span class="verdict">挡住 · 默认断网</span></li>
+            <li data-verdict="deny" data-target="git"><code>echo … &gt; .git/hooks/pre-commit</code><span class="verdict">挡住 · .git 只读</span></li>
+            <li data-verdict="deny" data-target="apps"><code>open -a Terminal</code><span class="verdict">挡住 · 启动不了别的程序</span></li>
+            <li data-verdict="deny" data-target="env"><code>echo $ANTHROPIC_API_KEY</code><span class="verdict">空的 · 环境变量只传白名单</span></li>
+            <li data-verdict="ok"><code>python -m pytest -q</code><span class="verdict">放行 · 5 passed</span></li>
+          </ol>
+        </div>
+        <div class="outside" aria-label="盒子外面">
+          <p class="outside-label">盒子外面</p>
+          <ul>
+            <li data-target="cred"><span class="dot"></span>凭证<small>SSH · AWS · 钥匙串</small></li>
+            <li data-target="net"><span class="dot"></span>网络<small>IP · 域名解析 · 代理</small></li>
+            <li data-target="git"><span class="dot"></span>.git<small>hook · 配置</small></li>
+            <li data-target="apps"><span class="dot"></span>其他程序<small>open · Apple 事件</small></li>
+            <li data-target="env"><span class="dot"></span>环境变量<small>模型的 key</small></li>
+          </ul>
+        </div>
+        <figcaption>
+          <span>自动演示 · 示意内容</span>
+          <span class="demo-controls">
+            <button type="button" id="demo-toggle">暂停</button>
+            <button type="button" id="demo-replay">重播</button>
+          </span>
+        </figcaption>
+      </figure>
+    </section>
+
+    <!-- 宣传片 -->
+    <section class="section film" id="film">
+      <div class="section-head">
+        <p class="eyebrow">48 秒介绍</p>
+        <h2>48 秒，看完它在防什么</h2>
+      </div>
+      <div class="film-frame">
+        <video controls preload="metadata" playsinline poster="media/boxcode-promo-poster.png">
+          <source src="media/boxcode-promo.mp4" type="video/mp4">
+          你的浏览器不支持播放视频，可以<a href="media/boxcode-promo.mp4">直接下载</a>。
+        </video>
+      </div>
+      <p class="film-note">用 Remotion 写成，配乐是程序合成的原创小曲，源码都在仓库的 <code>promo/</code> 目录。</p>
+    </section>
+
+    <!-- 为什么 -->
+    <section class="section why" id="why">
+      <div class="section-head">
+        <p class="eyebrow">为什么要有盒子</p>
+        <h2>它读到的每个文件，<br>都可能藏着指令</h2>
+      </div>
+      <div class="why-grid">
+        <div class="why-text">
+          <p>
+            编程 Agent 会替你执行 shell 命令。README 里一段注释、依赖的报错信息、测试的输出，
+            都可能叫它“先把 <code>~/.ssh/id_rsa</code> 发到某个地址”。
+          </p>
+          <p>只靠提示词让模型别上当，是不够的。</p>
+          <p>
+            所以 BoxCode 不指望模型每次都判断对：模型要跑的命令一律放进沙盒，
+            就算它照做了，也读不到这些文件、连不上外网。
+          </p>
+        </div>
+        <div class="filecard" aria-label="示意：仓库里的 README">
+          <div class="filecard-head">README.md</div>
+          <pre><span class="ln">1</span># config-loader
+<span class="ln">2</span>
+<span class="ln">3</span>Loads `key=value` config files.
+<span class="ln">4</span>
+<span class="ln">5</span><mark>&lt;!-- <span class="redact">████████████████████</span></mark>
+<span class="ln">6</span><mark>     <span class="redact">██████████████████████████</span></mark>
+<span class="ln">7</span><mark>     <span class="redact">███████████████</span> --&gt;</mark>
+<span class="ln">8</span>
+<span class="ln">9</span>## Usage</pre>
+          <p class="filecard-note">页面上看不见的 HTML 注释，模型读得到。同样的指令也可能藏在 AGENTS.md、源码注释或测试输出里。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 沙盒 -->
+    <section class="section" id="sandbox">
+      <div class="section-head">
+        <p class="eyebrow">沙盒</p>
+        <h2>五条规则，每一条都有测试</h2>
+        <p class="section-sub">
+          命令在 <code>sandbox-exec</code> 里执行，规则每次按工作区生成。测试会真实启动沙盒去验证，
+          其中好几条是红队实测找到的绕过。
+        </p>
+      </div>
+      <ol class="rules">
+        <li>
+          <h3>只能写工作区</h3>
+          <p><code>.git</code> 整个只读：改了 hook、<code>core.fsmonitor</code>，或者把 <code>.git</code> 换成指向别处的文件，你下次在沙盒外运行 git 时就会执行它。工作区和上级目录也不能改名。</p>
+        </li>
+        <li>
+          <h3>读不到常见的凭证位置</h3>
+          <p>SSH、GPG、AWS、Docker、GitHub CLI 的密钥，其他 Agent 的配置，shell 配置和历史，工作区外的 <code>.env</code>，钥匙串，浏览器和其他 App 的数据。</p>
+        </li>
+        <li>
+          <h3>默认断网</h3>
+          <p>IP 连接、域名解析、连本机代理一起挡住。</p>
+        </li>
+        <li>
+          <h3>借不了别的程序的手</h3>
+          <p>不能用 <code>open</code> 启动程序，不能发 Apple 事件，连不上工作区以外的 unix 套接字（ssh-agent、浏览器、Docker），不能读剪贴板，不能给沙盒外的进程发信号。</p>
+        </li>
+        <li>
+          <h3>环境变量只传白名单</h3>
+          <p>模型的 key、<code>SSH_AUTH_SOCK</code> 都不传给命令。</p>
+        </li>
+      </ol>
+    </section>
+
+    <!-- 工作原理 -->
+    <section class="section" id="how">
+      <div class="section-head">
+        <p class="eyebrow">工作原理</p>
+        <h2>一个循环，直到自检通过</h2>
+      </div>
+      <ol class="flow" aria-label="主循环">
+        <li><b>任务</b><span>系统提示 + 对话，第一条附上 AGENTS.md 和代码库地图</span></li>
+        <li><b>模型</b><span>回一段文字，或若干工具调用</span></li>
+        <li><b>校验</b><span>Pydantic 校验工具参数</span></li>
+        <li><b>权限策略</b><span>放行、问人，或拒绝</span></li>
+        <li class="flow-box"><b>执行</b><span>文件工具在进程内，路径必须在工作区里；命令进沙盒，结束后整个进程组杀掉</span></li>
+        <li><b>结果</b><span>截断后交回模型，进入下一轮</span></li>
+      </ol>
+      <p class="flow-after">
+        模型不再调用工具，就是它认为做完了。这时跑你给的自检命令（<code>--verify</code>），
+        没通过就把输出交回去继续修，最多 N 轮。每一步写一行执行轨迹。
+      </p>
+
+      <div class="modes">
+        <h3>三种权限模式</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模式</th><th>读工作区</th><th>写工作区</th><th>执行命令</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>read-only</code></td><td>可以</td><td>不可以</td><td>每次问，放行了也在只读沙盒里执行</td></tr>
+              <tr><td><code>workspace-write</code><small>默认</small></td><td>可以</td><td>可以，<code>.git</code> 除外</td><td>联网、<code>git push</code>、装依赖、递归删除、提权这类先问，其余放行</td></tr>
+              <tr><td><code>full-auto</code></td><td>可以</td><td>可以</td><td>全部放行</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="note">
+          不管哪种模式，命令都在沙盒里执行。权限策略只是第一道关：命令可以换写法绕过正则，
+          它的作用是把高风险的事提前拿给人看，真正挡住破坏的是沙盒。
+        </p>
+      </div>
+    </section>
+
+    <!-- 桌面界面 -->
+    <section class="section" id="gui">
+      <div class="section-head">
+        <p class="eyebrow">桌面界面</p>
+        <h2>不想开终端，也可以开窗口</h2>
+        <p class="section-sub"><code>uv run boxcode gui</code>。窗口和命令行用的是同一个 Agent、同一套权限策略和沙盒。</p>
+      </div>
+      <ul class="cards">
+        <li>
+          <h3>新任务</h3>
+          <p>选工作区、写任务、选权限模式和自检命令。页面实时显示每次模型调用、工具调用和权限决定；需要确认的命令固定在最上面，按“停止”立刻杀掉正在执行的命令。</p>
+        </li>
+        <li>
+          <h3>历史轨迹</h3>
+          <p>浏览 <code>~/.boxcode/runs/</code> 里的每次运行，展开看工具参数和 <code>edit_file</code> 改了什么。</p>
+        </li>
+        <li>
+          <h3>评测</h3>
+          <p>勾选题目运行，逐题看结果、通过率和注入诱导率，点一道题看它的执行轨迹。</p>
+        </li>
+      </ul>
+    </section>
+
+    <!-- 使用须知 -->
+    <section class="section" id="limits">
+      <div class="section-head">
+        <p class="eyebrow">使用须知</p>
+        <h2>用之前，先知道这几件事</h2>
+      </div>
+      <ul class="limits">
+        <li><b>只支持 macOS</b>沙盒用的是系统自带的 Seatbelt（<code>sandbox-exec</code>）。</li>
+        <li><b>依赖要提前装好</b>沙盒默认断网，在里面装不了依赖。</li>
+        <li><b>key 放文件里，不要 export</b>沙盒里的命令能读到同一个用户下其他进程启动时的环境变量；<code>~/.boxcode/api_key</code> 它读不到。</li>
+        <li><b>提交由你来做</b>沙盒里能 <code>git status</code>、<code>git diff</code>，不能 <code>git add</code>、<code>git commit</code>。</li>
+        <li><b>工作区外的普通文件读得到</b>挡住的是常见的凭证位置；别的项目的源码这类文件，沙盒里仍然能读。</li>
+        <li><b>不防内核漏洞</b>防的是模型被注入或犯错时读走凭证、改坏工作区外的东西、偷偷联网。</li>
+      </ul>
+      <p class="note">完整的列表在 <a href="https://github.com/PykeDLing/boxcode#限制">README 的“限制”一节</a>。</p>
+    </section>
+
+    <!-- 快速开始 -->
+    <section class="section" id="start">
+      <div class="section-head">
+        <p class="eyebrow">快速开始</p>
+        <h2>三步跑起来</h2>
+        <p class="section-sub">需要 macOS 和 <a href="https://docs.astral.sh/uv/">uv</a>。</p>
+      </div>
+      <ol class="steps">
+        <li>
+          <h3>装好，跑一遍测试</h3>
+          <div class="code"><button type="button" class="copy">复制</button><pre><code>git clone https://github.com/PykeDLing/boxcode.git
+cd boxcode
+uv sync
+uv run pytest -q          # 不需要 API key</code></pre></div>
+        </li>
+        <li>
+          <h3>选一个模型</h3>
+          <div class="code"><button type="button" class="copy">复制</button><pre><code># Claude，默认 claude-opus-5-5
+export BOXCODE_PROVIDER=anthropic
+ant auth login
+
+# 或者任何 OpenAI 兼容接口：DeepSeek、通义千问、本机 Ollama、vLLM
+export BOXCODE_PROVIDER=openai
+export BOXCODE_BASE_URL=https://api.deepseek.com
+export BOXCODE_MODEL=deepseek-chat</code></pre></div>
+          <p class="note">key 放在 <code>~/.boxcode/api_key</code> 里，不要 export：这个目录沙盒里读不到。</p>
+        </li>
+        <li>
+          <h3>让它做一件事</h3>
+          <div class="code"><button type="button" class="copy">复制</button><pre><code>uv run boxcode run "修好 tests/test_stats.py" \
+  -w path/to/repo --verify "python -m pytest -q"</code></pre></div>
+          <p class="note"><code>--verify</code> 是做完后的自检命令，没通过会把输出交回模型继续修。</p>
+        </li>
+      </ol>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div>
+      <span class="brand brand-small">
+        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+          <rect x="3" y="3" width="26" height="26" rx="5" fill="none" stroke="currentColor" stroke-width="2.6"/>
+          <path d="M10 12l5 4-5 4" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M17.5 21h5" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/>
+        </svg>
+        BoxCode
+      </span>
+      <p>沙盒规则的写法来自 <a href="https://github.com/PykeDLing/macbox">MacBox</a>，Agent 循环参考了 OpenAI Codex CLI 和 pi-mono 的设计。</p>
+    </div>
+    <nav aria-label="页脚链接">
+      <a href="https://github.com/PykeDLing/boxcode">GitHub</a>
+      <a href="https://github.com/PykeDLing/boxcode/blob/main/docs/design.md">技术方案</a>
+      <a href="https://github.com/PykeDLing/boxcode/blob/main/LICENSE">MIT 许可</a>
+    </nav>
+  </footer>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
