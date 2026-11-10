@@ -1,0 +1,37 @@
+name: 部署网页
+
+# main 上的 site/ 有改动就把它发布到 GitHub Pages；也可以在 Actions 页面手动触发
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# 发布 Pages 需要的最小权限
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同时只发布一次；正在发布的不取消，免得网页停在半截
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      # site/ 是纯静态文件，不需要构建，整个目录原样上传
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v5

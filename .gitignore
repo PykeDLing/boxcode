@@ -31,3 +31,9 @@ evals/results/
 
 # Claude Code 给子代理建的临时 worktree
 .claude/worktrees/
+
+# 宣传片工程（Remotion）的依赖
+promo/node_modules/
+
+# 配乐由 promo/music/compose.mjs 生成
+promo/public/music.wav
