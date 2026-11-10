@@ -90,6 +90,7 @@ key 尽量不要放在环境变量里（包括写进 `~/.zshrc` 再 export）：
 uv run boxcode run "修好 tests/test_stats.py" -w path/to/repo --verify "python -m pytest -q"
 
 # 跑全部评测题，报告写到 evals/results/<时间>/report.json；--repeat 3 每题跑 3 次
+# 报告里记着这一轮的配置（模型、effort、上下文开关……）和 BoxCode 代码的提交号
 uv run boxcode eval --repeat 3
 ```
 

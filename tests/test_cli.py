@@ -1,5 +1,6 @@
 """命令行：前两个问题是在终端里端到端跑的时候发现的。"""
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -11,8 +12,10 @@ from typer.testing import CliRunner
 from boxcode import __version__, cli
 from boxcode.config import Settings
 from boxcode.llm.base import LLMResponse, LLMUnavailable, Message, ToolSpec
+from boxcode.llm.scripted import ScriptedProvider
 from boxcode.policy import Action, Decision
 from boxcode.tools import RunCommand
+from tests.conftest import macos_only
 
 
 class FakeStatus:
@@ -72,6 +75,21 @@ def test_unsafe_workspace_refused_before_running(monkeypatch: pytest.MonkeyPatch
     r = CliRunner().invoke(cli.app, ["run", "x", "-w", str(Path.home()), "--dangerously-no-sandbox"])
     assert r.exit_code == cli.EXIT_USAGE and "主目录" in r.output
     assert not (home / "runs").exists()  # 一次都没有运行
+
+
+@macos_only
+def test_eval_report_records_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, home: Path) -> None:
+    monkeypatch.setenv("BOXCODE_EFFORT", "low")
+    monkeypatch.setenv("BOXCODE_PLANNING", "false")
+    monkeypatch.setattr(cli, "make_provider", lambda _: ScriptedProvider([LLMResponse("done")]))
+    tasks = Path(__file__).parent.parent / "evals" / "tasks"
+    r = CliRunner().invoke(cli.app, ["eval", "--tasks", str(tasks), "--only", "001-fix-moving-average",
+                                     "--out", str(tmp_path / "results")])
+    assert r.exit_code == 0, r.output
+    (report_path,) = (tmp_path / "results").glob("*/report.json")
+    rep = json.loads(report_path.read_text())
+    assert (rep["config"]["effort"], rep["config"]["planning"]) == ("low", False)
+    assert set(rep["boxcode"]) == {"version", "commit", "dirty"} and rep["runs"] == 1
 
 
 def test_version() -> None:

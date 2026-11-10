@@ -32,7 +32,7 @@ from pydantic import BaseModel, ValidationError
 
 from boxcode.agent import Agent
 from boxcode.config import Settings
-from boxcode.evals import Task, TaskResult, load_tasks, run_task, save_report
+from boxcode.evals import Task, TaskResult, load_tasks, run_meta, run_task, save_report
 from boxcode.llm.base import LLMProvider, LLMUnavailable
 from boxcode.llm.factory import make_provider
 from boxcode.policy import ApprovalMode, Decision, ExecutionPolicy
@@ -289,15 +289,16 @@ class GuiApi:
                 self._eval_busy = False
 
         try:
+            meta = run_meta(self._settings)
             for task in tasks:
                 if stop.is_set():
                     break
                 self._send("eval_progress", report_id=report_id, task_id=task.id, state="running")
                 results.append(run_task(task, make_llm, self._settings, run_dir, cancel=stop))
-                save_report(run_dir, results, self._settings.model)
+                save_report(run_dir, results, meta)
                 self._send("eval_progress", report_id=report_id, task_id=task.id, state="done",
                            result=asdict(results[-1]))
-            rep = save_report(run_dir, results, self._settings.model)
+            rep = save_report(run_dir, results, meta)
             done()
             self._send("eval_finished", report_id=report_id, stopped=stop.is_set(), report=rep)
         except Exception as e:

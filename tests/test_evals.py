@@ -1,5 +1,7 @@
 """评测框架自测：用剧本模型做题，确认复制、执行、判分、诱导统计都对，并且判分骗不过去。"""
 
+import json
+import subprocess
 import threading
 import uuid
 from collections.abc import Sequence
@@ -7,9 +9,10 @@ from pathlib import Path
 
 import pytest
 
+from boxcode import __version__
 from boxcode.config import Settings
-from boxcode.evals import Task, TaskResult, load_tasks, report, run_task
-from boxcode.evals.runner import copy_editable
+from boxcode.evals import Task, TaskResult, load_tasks, report, run_meta, run_task, save_report
+from boxcode.evals.runner import UNKNOWN_VERSION, CodeVersion, code_version, copy_editable, parse_git_output
 from boxcode.llm.base import LLMResponse, Message, ToolCall, ToolSpec
 from boxcode.llm.scripted import ScriptedProvider, call
 from tests.conftest import macos_only
@@ -96,6 +99,83 @@ def test_report_merges_repeated_runs() -> None:
     assert rep["per_task"][0] == {"id": "a", "category": "injection", "runs": 2, "passed": 1, "induced": 1,
                                   "avg_llm_calls": 3.0, "avg_tokens": 12}
     assert [r["id"] for r in rep["results"]] == ["a", "b", "a#2"]  # 每一行对得上自己的轨迹
+
+
+def test_report_records_config_and_code_version(tmp_path: Path) -> None:
+    # 对比实验靠这些对上“这份报告是怎么跑出来的”：以前只记了模型名
+    settings = Settings(provider="anthropic", effort="low", api_key="sk-secret", home=tmp_path / "home",
+                        context_compact_tokens=0, repo_map_chars=0, planning=False)
+    meta = run_meta(settings, CodeVersion("a" * 40, True))
+    config = meta["config"]
+    assert meta["model"] == config["model"] == "claude-opus-5-5"
+    assert (config["provider"], config["effort"]) == ("anthropic", "low")
+    assert (config["context_compact_tokens"], config["repo_map_chars"], config["planning"]) == (0, 0, False)
+    # 每一项配置都在，新加的开关不用记得来补；key、本机路径、Claude 用不到的 base_url 不写
+    assert set(config) == set(Settings.model_fields) - {"api_key", "home", "base_url"}
+    assert meta["boxcode"] == {"version": __version__, "commit": "a" * 40, "dirty": True}
+    assert "sk-secret" not in json.dumps(meta) and str(tmp_path) not in json.dumps(meta)
+
+    saved = save_report(tmp_path, [_result("a", True)], meta)
+    assert json.loads((tmp_path / "report.json").read_text()) == saved
+    assert saved["config"]["effort"] == "low" and saved["boxcode"]["dirty"] and saved["pass_rate"] == 1.0
+
+
+def test_report_keeps_endpoint_without_credentials() -> None:
+    settings = Settings(base_url="https://user:hunter2@llm.example:8443/v1?api-key=hunter3")
+    meta = run_meta(settings, UNKNOWN_VERSION)
+    assert meta["config"]["base_url"] == "https://llm.example:8443/v1"  # 分得出是 DeepSeek 还是本机 Ollama 就够了
+    assert "hunter" not in json.dumps(meta)
+    assert meta["boxcode"] == {"version": __version__, "commit": None, "dirty": None}
+
+
+@pytest.mark.parametrize(("stdout", "expected"), [
+    ("a" * 40 + "\n", CodeVersion("a" * 40, False)),
+    ("a" * 40 + "\n M src/boxcode/cli.py\n?? new.py\n", CodeVersion("a" * 40, True)),
+    ("b" * 64 + "\n", CodeVersion("b" * 64, False)),  # SHA-256 的仓库
+    ("", UNKNOWN_VERSION),
+    ("fatal: not a git repository\n", UNKNOWN_VERSION),
+])
+def test_parse_git_output(stdout: str, expected: CodeVersion) -> None:
+    assert parse_git_output(stdout) == expected
+
+
+def _git(repo: Path, *args: str) -> None:
+    # 测试自己建仓库用（沙盒里建不了：.git 在哪儿都只读）；不受本机 git 配置里的签名、hook 影响
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+                   check=True, capture_output=True)
+
+
+@macos_only
+def test_code_version_reads_commit_and_uncommitted_changes(tmp_path: Path) -> None:
+    repo = tmp_path.resolve() / "checkout"
+    package = repo / "src" / "pkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    _git(repo, "init", "-q")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "init")
+    clean = code_version(package)
+    assert clean.commit is not None and len(clean.commit) in (40, 64) and clean.dirty is False
+    # 还没加进 git 的文件也算改动：它一样会改变跑出来的结果
+    (repo / "src" / "new.py").write_text("x = 1\n")
+    assert code_version(package) == CodeVersion(clean.commit, True)
+
+
+@macos_only
+def test_code_version_ignores_someone_elses_repo(tmp_path: Path) -> None:
+    # BoxCode 装进别的项目的虚拟环境时，往上找到的是那个项目的仓库：它的提交号不能记成 BoxCode 的
+    repo = tmp_path.resolve() / "other-project"
+    installed = repo / ".venv" / "site-packages" / "boxcode"
+    installed.mkdir(parents=True)
+    (installed / "__init__.py").write_text("")
+    (repo / ".gitignore").write_text(".venv/\n")
+    _git(repo, "init", "-q")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "init")
+    assert code_version(installed) == UNKNOWN_VERSION
+    assert code_version(tmp_path.resolve()) == UNKNOWN_VERSION  # 根本不在仓库里
+    assert code_version(tmp_path / "missing") == UNKNOWN_VERSION
 
 
 @macos_only
