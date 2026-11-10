@@ -5,6 +5,8 @@
 - Claude 自己的 assistant 回复不转换：原始内容块存在 AssistantMessage.native 里原样回传。思考块（thinking）
   必须原样带回，删掉或改动会让后面的请求出错，所以历史只追加、不修改
 - 顶层 cache_control 自动缓存到最后一个内容块：Agent 每轮的前缀不变，越往后越省
+- 旧的工具结果由服务器清理（context editing），请求里永远是完整的历史。思考块的签名绑定它前面的全部内容，
+  在客户端改旧的工具结果，后面的思考块全部失效，接口直接返回 400（真实评测里压缩后的下一次请求必失败）
 
 请求用流式（工具参数里可能有整个文件），工具开启 eager_input_streaming，参数边生成边传回。
 代价是服务器不再校验参数，所以：工具用 Pydantic 校验每个参数；撞上 max_tokens 的那一轮不执行工具；
@@ -19,7 +21,7 @@ from collections.abc import Iterator, Sequence
 from typing import Any, Protocol, cast
 
 import anthropic
-from anthropic.types.beta import BetaMessage, BetaOutputConfigParam
+from anthropic.types.beta import BetaContextManagementConfigParam, BetaMessage, BetaOutputConfigParam
 
 from boxcode.config import Settings
 from boxcode.llm.base import (
@@ -29,6 +31,7 @@ from boxcode.llm.base import (
     LLMUnavailable,
     Message,
     Native,
+    ServerCompaction,
     StopReason,
     SystemMessage,
     ToolCall,
@@ -40,6 +43,9 @@ from boxcode.llm.base import (
 PROVIDER = "anthropic"
 MAX_TOKENS = 64000
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+CONTEXT_EDITING_BETA = "context-management-2025-06-27"
+# 服务器清理时留下最近这么多次工具调用的结果（一轮可能并行好几个）
+KEEP_TOOL_USES = 6
 JSON_RETRIES = 2
 
 Block = dict[str, Any]
@@ -125,13 +131,33 @@ def _stop_reason(raw: str | None) -> StopReason:
     return StopReason.END
 
 
-def parse_response(blocks: list[Block], stop_reason: str | None, usage: Usage) -> LLMResponse:
+def context_management(threshold_tokens: int) -> BetaContextManagementConfigParam:
+    """超过阈值时清理旧的工具结果，一次至少清掉阈值的一半：和客户端压缩一样成批清理，缓存不会轮轮失效。"""
+    return {"edits": [{
+        "type": "clear_tool_uses_20250919",
+        "trigger": {"type": "input_tokens", "value": threshold_tokens},
+        "keep": {"type": "tool_uses", "value": KEEP_TOOL_USES},
+        "clear_at_least": {"type": "input_tokens", "value": threshold_tokens // 2},
+    }]}
+
+
+def server_compaction(final: BetaMessage) -> ServerCompaction | None:
+    applied = final.context_management.applied_edits if final.context_management is not None else []
+    edits = [e for e in applied if e.type == "clear_tool_uses_20250919"]
+    if not edits:
+        return None
+    return ServerCompaction(sum(e.cleared_tool_uses for e in edits), sum(e.cleared_input_tokens for e in edits))
+
+
+def parse_response(
+    blocks: list[Block], stop_reason: str | None, usage: Usage, compaction: ServerCompaction | None = None,
+) -> LLMResponse:
     blocks = strip_before_fallback(blocks)
     text = "\n".join(b["text"] for b in blocks if b.get("type") == "text" and b.get("text")) or None
     calls = [ToolCall(id=b["id"], name=b["name"], arguments=json.dumps(b.get("input") or {}, ensure_ascii=False))
              for b in blocks if b.get("type") == "tool_use"]
     return LLMResponse(content=text, tool_calls=calls, usage=usage, stop_reason=_stop_reason(stop_reason),
-                       native=Native(PROVIDER, blocks))
+                       native=Native(PROVIDER, blocks), server_compaction=compaction)
 
 
 class _Stream(Protocol):
@@ -154,6 +180,8 @@ class AnthropicProvider:
     def __init__(self, settings: Settings) -> None:
         self.name = settings.model
         self._effort = settings.effort
+        self._compact_tokens = settings.context_compact_tokens
+        self.clears_tool_results = self._compact_tokens > 0  # 主循环看到这个就不再自己压缩
         # 不传 api_key：SDK 依次找 ANTHROPIC_API_KEY、ANTHROPIC_AUTH_TOKEN、`ant auth login` 的配置
         self._client = anthropic.Anthropic()
 
@@ -161,6 +189,8 @@ class AnthropicProvider:
         self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: threading.Event | None = None,
     ) -> LLMResponse:
         system, msgs = convert_messages(messages)
+        betas = [FALLBACK_BETA, *([CONTEXT_EDITING_BETA] if self.clears_tool_results else [])]
+        editing = context_management(self._compact_tokens) if self.clears_tool_results else anthropic.omit
         for attempt in range(JSON_RETRIES + 1):
             if cancel is not None and cancel.is_set():
                 raise LLMCancelled
@@ -174,8 +204,9 @@ class AnthropicProvider:
                     output_config=cast(BetaOutputConfigParam, {"effort": self._effort}),
                     cache_control={"type": "ephemeral"},
                     # 被安全分类器拒绝时，服务器按拒绝类别自动换备用模型重跑
-                    betas=[FALLBACK_BETA],
+                    betas=betas,
                     fallbacks="default",
+                    context_management=editing,
                 ) as stream:
                     final = read_stream(stream, cancel)
                 break
@@ -197,4 +228,4 @@ class AnthropicProvider:
         cache_write = u.cache_creation_input_tokens or 0
         usage = Usage(prompt_tokens=u.input_tokens + cache_read + cache_write, completion_tokens=u.output_tokens,
                       cached_tokens=cache_read)
-        return parse_response([b.to_dict() for b in final.content], final.stop_reason, usage)
+        return parse_response([b.to_dict() for b in final.content], final.stop_reason, usage, server_compaction(final))

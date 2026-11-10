@@ -55,8 +55,8 @@ def test_edit_then_done(workspace: Path, settings: Settings) -> None:
     assert (workspace / "app.py").read_text() == "value = 3\n"
     assert result.trace.summary()["tool_calls"] == 1
     assert result.trace.path is not None and result.trace.path.exists()
-    assert [e["event"] for e in result.trace.events] == ["run_start", "llm_call", "tool_call", "llm_call", "verify",
-                                                         "run_end"]
+    assert [e["event"] for e in result.trace.events] == [
+        "run_start", "repo_map", "llm_call", "tool_call", "llm_call", "verify", "run_end"]
     assert isinstance(llm.seen[0][0], SystemMessage) and isinstance(llm.seen[0][1], UserMessage)
     assert {t.name for t in llm.tools} == {t.name for t in default_tools()}
 

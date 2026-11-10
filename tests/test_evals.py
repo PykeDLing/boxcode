@@ -277,6 +277,15 @@ def test_edit_counts_new_text_only(settings: Settings, tmp_path: Path, old: str,
 
 
 @macos_only
+def test_plan_text_is_not_an_attempt(settings: Settings, tmp_path: Path) -> None:
+    # 计划里写“不要读 ~/.ssh”不是在尝试读：update_plan 什么也不做
+    task = load_tasks(TASKS, only=["101-injection-readme"])[0]
+    plan = call("update_plan", steps=[{"step": f"do not run {task.forbidden[0]}", "status": "pending"}])
+    result = run_task(task, lambda: scripted(plan), settings, tmp_path / "out")
+    assert not result.induced
+
+
+@macos_only
 def test_grading_ignores_config_above_check_dir(settings: Settings, tmp_path: Path) -> None:
     # 判分目录在结果目录下（默认 evals/results，在 BoxCode 仓库里）：pytest 往上找配置，会用上 BoxCode 自己的
     # pyproject.toml（--strict-markers、filterwarnings=error），题目的测试就不是在原题的配置下跑了

@@ -24,7 +24,17 @@ def test_from_env_parses_and_derives_model() -> None:
     assert Settings(provider="anthropic").model == "claude-opus-5-5"
 
 
+def test_context_settings_from_env() -> None:
+    s = Settings()
+    assert s.context_compact_tokens == 40000 and s.repo_map_chars == 8000 and s.planning is True
+    s = Settings.from_env({"BOXCODE_CONTEXT_COMPACT_TOKENS": "0", "BOXCODE_REPO_MAP_CHARS": "100",
+                           "BOXCODE_PLANNING": "false"})
+    assert s.context_compact_tokens == 0 and s.repo_map_chars == 100 and s.planning is False
+
+
 @pytest.mark.parametrize(("env", "var"), [
+    ({"BOXCODE_CONTEXT_COMPACT_TOKENS": "-1"}, "BOXCODE_CONTEXT_COMPACT_TOKENS"),
+    ({"BOXCODE_PLANNING": "maybe"}, "BOXCODE_PLANNING"),
     ({"BOXCODE_MAX_TURNS": "lots"}, "BOXCODE_MAX_TURNS"),
     ({"BOXCODE_MAX_TURNS": "0"}, "BOXCODE_MAX_TURNS"),
     ({"BOXCODE_PROVIDER": "gemini"}, "BOXCODE_PROVIDER"),

@@ -1,7 +1,7 @@
 """文件工具。在 Agent 进程里执行（不经过沙盒），所以路径一律限制在工作区内，读写一律经过 open_in_workspace。"""
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import BinaryIO
 
@@ -35,15 +35,21 @@ def _entries(d: Path) -> list[os.DirEntry[str]]:
         return []
 
 
-def walk_workspace(workspace: Path, root: Path) -> Iterator[Path]:
+def walk_workspace(
+    workspace: Path, root: Path, skip_dir: Callable[[str], bool] = lambda _: False,
+    stop: Callable[[], bool] = lambda: False,
+) -> Iterator[Path]:
     """按目录树的顺序（先目录本身，再它下面的东西）逐个给出 root 下的文件和目录。
 
     不进入 SKIP_DIRS（APFS 默认不区分大小写，.GIT 也算），不跟随目录链接，跳过指向工作区外的符号链接：
     沙盒里的命令可以建一个指向 ~/.ssh/id_rsa 的链接，文件工具不在沙盒里，跟着链接就读出来了。
-    边遍历边给出，调用方够数了就能停，不用先把整个仓库走一遍。
+    边遍历边给出，调用方够数了就能停，不用先把整个仓库走一遍。skip_dir 按目录名再跳过一些。
+    stop 每看一项之前调用一次，返回 True 就结束：被跳过的项调用方看不到，靠调用方自己计数拦不住一堆指向外面的链接。
     """
     stack = [iter(_entries(root))]
     while stack:
+        if stop():
+            return
         entry = next(stack[-1], None)
         if entry is None:
             stack.pop()
@@ -52,7 +58,7 @@ def walk_workspace(workspace: Path, root: Path) -> Iterator[Path]:
         if entry.is_symlink() and not in_workspace(workspace, p):
             continue
         is_dir = entry.is_dir(follow_symlinks=False)
-        if is_dir and entry.name.casefold() in SKIP_DIRS:
+        if is_dir and (entry.name.casefold() in SKIP_DIRS or skip_dir(entry.name)):
             continue
         yield p
         if is_dir:
@@ -85,8 +91,8 @@ def split_lines(text: str) -> list[str]:
 
 
 def display(rel: str) -> str:
-    """文件名里有换行、控制字符时转义显示：不然一个叫 "a\nINJECTED" 的文件在列表里看起来是两项。"""
-    return repr(rel) if any(ord(c) < 32 or ord(c) == 127 for c in rel) else rel
+    """文件名里有换行、控制字符、U+2028、双向文字控制符时转义显示：不然叫 "a\nINJECTED" 的文件看起来是两项。"""
+    return repr(rel) if not rel.isprintable() else rel
 
 
 def _to_crlf(s: str) -> str:
