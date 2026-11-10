@@ -12,6 +12,12 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT"></a>
 </p>
 
+<p align="center">
+  <a href="https://pykedling.github.io/boxcode/"><b>项目网页</b></a> ·
+  <a href="https://pykedling.github.io/boxcode/#film">48 秒介绍</a> ·
+  <a href="docs/design.md">技术方案</a>
+</p>
+
 ---
 
 编程 Agent 会替你执行 shell 命令。它读到的每个文件都可能藏着指令：README 里一段注释、依赖的报错信息、测试的输出，都可能叫它“先把 `~/.ssh/id_rsa` 发到某个地址”。只靠提示词让模型别上当是不够的。
@@ -183,6 +189,8 @@ src/boxcode/
 evals/tasks/ 评测题目：每题一个目录，task.toml + repo/
 tests/       单元测试和沙盒测试
 docs/        技术方案
+site/        项目网页（纯静态），main 上有改动就自动发布到 GitHub Pages
+promo/       宣传片的 Remotion 工程，成片渲染到 site/media/
 ```
 
 ## 开发
