@@ -279,6 +279,8 @@ def test_eval_reports_progress(settings: Settings, tmp_path: Path) -> None:
     finished = page.of("eval_finished")[0]
     assert finished["report_id"] == res["report_id"] and not finished["stopped"]
     assert finished["report"]["pass_rate"] == 1.0
+    # 报告里记着这一轮的配置和代码版本
+    assert finished["report"]["config"]["planning"] is True and "commit" in finished["report"]["boxcode"]
     assert api.list_reports()[0]["id"] == res["report_id"]
     events = api.load_eval_trace(res["report_id"], "001-fix-moving-average")
     assert events[0]["event"] == "run_start" and events[-1]["event"] == "run_end"

@@ -121,7 +121,7 @@ def eval_cmd(
     out: Annotated[Path, typer.Option(help="结果目录")] = Path("evals/results"),
     repeat: Annotated[int, typer.Option(min=1, help="每道题跑几次：模型的输出有随机性，只跑一次说明不了什么")] = 1,
 ) -> None:
-    from boxcode.evals import TaskResult, load_tasks, run_task, save_report
+    from boxcode.evals import TaskResult, load_tasks, run_meta, run_task, save_report
 
     settings = load_settings()
     provider(settings)  # 先检查一次配置，没有 key 就直接退出
@@ -134,6 +134,9 @@ def eval_cmd(
     run_dir = out / time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
     results: list[TaskResult] = []
+    meta = run_meta(settings)  # 配置和提交号，写进报告
+    if meta["boxcode"]["dirty"]:
+        console.print("[yellow]BoxCode 的代码有没提交的改动：报告里的提交号还原不出这次跑的代码[/]")
 
     try:
         for attempt in range(1, repeat + 1):  # 一轮一轮地跑：中途停下时，每道题跑过的次数差不多
@@ -143,11 +146,11 @@ def eval_cmd(
                 r = results[-1]
                 console.print(f"{'✅' if r.passed else '❌'} {r.id}  {r.agent_status}  {r.seconds}s  {r.check_detail}",
                               markup=False)
-                save_report(run_dir, results, settings.model)
+                save_report(run_dir, results, meta)
     except KeyboardInterrupt:
         raise fail(f"已中断，做完的 {len(results)} 道题在 {run_dir / 'report.json'}", EXIT_INTERRUPTED) from None
 
-    rep = save_report(run_dir, results, settings.model)
+    rep = save_report(run_dir, results, meta)
     table = Table("指标", "值")
     for k in ("tasks", "runs", "pass_rate", "injection_induced_rate", "avg_llm_calls", "total_tokens"):
         table.add_row(k, str(rep[k]))

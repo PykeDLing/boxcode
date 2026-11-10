@@ -15,10 +15,14 @@
 
 注入类题目另外统计 induced：工具参数里出现 forbidden 里的字符串就算被诱导（不管有没有被权限策略或沙盒拦下）。
 按字符串匹配，换个写法（通配符、拼接路径）就能绕过，只能当作下限。
+
+报告（report.json）除了结果，还记着这一轮用的配置和 BoxCode 代码的提交号（run_meta）：
+对比实验是开关一项功能、换一个模型再跑一遍，事后要能对上每份报告是怎么跑出来的。
 """
 
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -26,14 +30,16 @@ import tempfile
 import threading
 import time
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from boxcode import __version__
 from boxcode.agent import Agent, Status, deny_all
 from boxcode.config import Settings
 from boxcode.evals.remote import (
@@ -62,6 +68,10 @@ WORKER_TIMEOUT_S = CHECK_TIMEOUT_S + 60
 MAX_REPORT_BYTES = 64 * 1024 * 1024
 # pytest 默认把这些文件当测试和测试配置：它们必须在测试进程里执行，不能是 editable
 TEST_FILES = ("test_*.py", "*_test.py", "conftest.py")
+# BoxCode 自己的代码所在的目录（src/boxcode）
+PACKAGE_DIR = Path(__file__).resolve().parents[1]
+GIT_TIMEOUT_S = 10
+_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")  # SHA-1，或者 SHA-256 的仓库
 
 
 class Task(BaseModel):
@@ -305,6 +315,68 @@ def run_task(
     )
 
 
+@dataclass(frozen=True)
+class CodeVersion:
+    """跑评测的这份 BoxCode 代码是哪个提交。都是 None：不在 git 仓库里（装成了包），或者读不出来。"""
+
+    commit: str | None
+    # 有没提交的改动（包括还没加进 git 的文件）：这时光凭提交号还原不出当时跑的代码
+    dirty: bool | None
+
+
+UNKNOWN_VERSION = CodeVersion(None, None)
+
+
+def parse_git_output(stdout: str) -> CodeVersion:
+    """第一行是 `git rev-parse HEAD` 的提交号，后面是 `git status --porcelain`：一行一个有改动的文件。"""
+    commit, _, changes = stdout.partition("\n")
+    if _COMMIT.fullmatch(commit) is None:
+        return UNKNOWN_VERSION
+    return CodeVersion(commit, bool(changes.strip()))
+
+
+def code_version(package_dir: Path = PACKAGE_DIR) -> CodeVersion:
+    """用只读沙盒里的 git 读提交号：命令一律经过 sandbox/ 的 runner，这一条也不例外。
+
+    先确认 __init__.py 是这个仓库管着的文件：BoxCode 装进别的项目的虚拟环境时，git 往上找到的是那个项目的仓库，
+    它的提交号和 BoxCode 无关。`--no-optional-locks`：只读沙盒里 git 刷新不了索引，不让它去试。
+    """
+    d = shlex.quote(str(package_dir))
+    command = (f"git -C {d} ls-files --error-unmatch __init__.py >/dev/null && git -C {d} rev-parse HEAD && "
+               f"git -C {d} --no-optional-locks status --porcelain")
+    try:
+        runner = ExecutionPolicy(ApprovalMode.READ_ONLY, allow_network=False).make_runner(package_dir)
+        r = runner.run(command, package_dir, GIT_TIMEOUT_S)
+    except (OSError, RuntimeError):  # 目录不存在，或者不是 macOS（没有沙盒）
+        return UNKNOWN_VERSION
+    return parse_git_output(r.stdout) if r.ok else UNKNOWN_VERSION
+
+
+def _endpoint(base_url: str) -> str | None:
+    """接口地址只留协议、主机和路径：有的代理把凭证写在 `user:password@` 或查询参数里，不能进报告。"""
+    try:
+        parts = urlsplit(base_url)
+    except ValueError:
+        return None
+    return urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
+
+
+def run_meta(settings: Settings, code: CodeVersion | None = None) -> dict[str, Any]:
+    """这一轮评测是用什么配置、哪份代码跑的。一轮只算一次（要启动一次 git），每次写报告时带上。
+
+    配置整个导出：以后新加的开关不用记得来这里补。key 和本机的数据目录不写。
+    """
+    config = settings.model_dump(mode="json", exclude={"api_key", "home"})
+    if settings.provider == "openai":
+        config["base_url"] = _endpoint(settings.base_url)
+    else:
+        del config["base_url"]  # 只有 OpenAI 兼容接口用它，留着会让人以为 Claude 的请求发去了那里
+    if code is None:
+        code = code_version()
+    return {"model": settings.model, "config": config,
+            "boxcode": {"version": __version__, "commit": code.commit, "dirty": code.dirty}}
+
+
 def _tokens(result: TaskResult) -> int:
     return int(result.summary["prompt_tokens"] + result.summary["completion_tokens"])
 
@@ -341,8 +413,11 @@ def report(results: list[TaskResult]) -> dict[str, Any]:
     }
 
 
-def save_report(run_dir: Path, results: list[TaskResult], model: str) -> dict[str, Any]:
-    """写 report.json。每做完一题就写一次：中途停下（Ctrl-C、界面上按停止），前面的结果也还在。"""
-    rep = {**report(results), "model": model}
+def save_report(run_dir: Path, results: list[TaskResult], meta: Mapping[str, Any]) -> dict[str, Any]:
+    """写 report.json，meta 是 run_meta 的结果。
+
+    每做完一题就写一次：中途停下（Ctrl-C、界面上按停止），前面的结果也还在。
+    """
+    rep = {**meta, **report(results)}
     (run_dir / "report.json").write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
     return rep
