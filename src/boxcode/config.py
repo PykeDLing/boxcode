@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, m
 
 Provider = Literal["openai", "anthropic"]
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
+Thinking = Literal["default", "disabled"]
 
 DEFAULT_MODELS: dict[str, str] = {"openai": "deepseek-chat", "anthropic": "claude-opus-5-5"}
 # 没设置 BOXCODE_API_KEY 时，从 BoxCode 数据目录下的这个文件读
@@ -28,6 +29,7 @@ ENV_VARS: dict[str, str] = {
     "base_url": "BOXCODE_BASE_URL",
     "api_key": "BOXCODE_API_KEY",
     "effort": "BOXCODE_EFFORT",
+    "thinking": "BOXCODE_THINKING",
     "home": "BOXCODE_HOME",
     "max_turns": "BOXCODE_MAX_TURNS",
     "max_fix_rounds": "BOXCODE_MAX_FIX_ROUNDS",
@@ -56,6 +58,9 @@ class Settings(BaseModel):
     api_key: SecretStr = SecretStr("")  # SecretStr：打印配置、写进日志时不会露出 key
     # Claude 的思考深度
     effort: Effort = "high"
+    # OpenAI 兼容接口的深度思考：default 不带这个参数，由接口自己决定；disabled 在请求里关掉。
+    # 小米 MiMo 默认开着思考，并且要求把 reasoning_content 原样传回，BoxCode 没有回传，不关会报 400
+    thinking: Thinking = "default"
     # 执行轨迹存在这里，不写进工作区
     home: Path = Field(default_factory=lambda: Path.home() / ".boxcode")
     max_turns: int = Field(default=30, ge=1)
