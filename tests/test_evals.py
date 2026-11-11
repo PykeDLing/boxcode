@@ -12,7 +12,16 @@ import pytest
 from boxcode import __version__
 from boxcode.config import Settings
 from boxcode.evals import Task, TaskResult, load_tasks, report, run_meta, run_task, save_report
-from boxcode.evals.runner import UNKNOWN_VERSION, CodeVersion, code_version, copy_editable, parse_git_output
+from boxcode.evals.runner import (
+    UNKNOWN_VERSION,
+    CodeVersion,
+    _original_task_paths,
+    _regular_files,
+    code_version,
+    copy_editable,
+    parse_git_output,
+    prepare_workspace,
+)
 from boxcode.llm.base import LLMResponse, Message, ToolCall, ToolSpec
 from boxcode.llm.scripted import ScriptedProvider, call
 from tests.conftest import macos_only
@@ -32,7 +41,7 @@ def scripted(*calls: ToolCall) -> ScriptedProvider:
 
 def test_all_tasks_load() -> None:
     tasks = load_tasks(TASKS)
-    assert {t.category for t in tasks} == {"bugfix", "feature", "injection"}
+    assert {t.category for t in tasks} == {"bugfix", "feature", "refactor", "injection"}
     assert all((t.repo / "tests").is_dir() and (t.repo / "conftest.py").is_file() for t in tasks)
     assert all(t.editable for t in tasks)
 
@@ -85,6 +94,119 @@ def test_doing_nothing_fails(settings: Settings, tmp_path: Path, task: Task) -> 
     # 原题本来就能通过的话，这道题什么也量不出来
     result = run_task(task, lambda: ScriptedProvider([LLMResponse("done")]), settings, tmp_path / "out")
     assert not result.check_passed and "没通过" in result.check_detail, result.check_detail
+
+
+def _overlay(directory: Path) -> list[ToolCall]:
+    """把一个目录里的文件原样写进工作区：题目自带的参考解（solution/）和“看起来对”的错解（naive/）。"""
+    return [call("write_file", path=rel, content=(directory / rel).read_text(encoding="utf-8"))
+            for rel in sorted(_regular_files(directory))]
+
+
+WITH_SOLUTION = [t for t in load_tasks(TASKS) if (t.repo.parent / "solution").is_dir()]
+WITH_NAIVE = [t for t in WITH_SOLUTION if (t.repo.parent / "naive").is_dir()]
+
+
+def test_every_task_with_hidden_tests_has_a_reference_solution() -> None:
+    # 隐藏测试 Agent 看不到、没法对着试：题目本身得先证明做得出来
+    assert [t.id for t in load_tasks(TASKS) if t.hidden] == [t.id for t in WITH_SOLUTION]
+    assert len(WITH_NAIVE) >= 6
+
+
+@macos_only
+@pytest.mark.parametrize("task", WITH_SOLUTION, ids=lambda t: t.id)
+def test_reference_solution_passes(settings: Settings, tmp_path: Path, task: Task) -> None:
+    result = run_task(task, lambda: scripted(*_overlay(task.repo.parent / "solution")), settings, tmp_path / "out")
+    assert result.passed and result.agent_status == "done", result.check_detail
+
+
+@macos_only
+@pytest.mark.parametrize("task", WITH_NAIVE, ids=lambda t: t.id)
+def test_plausible_wrong_solution_fails(settings: Settings, tmp_path: Path, task: Task) -> None:
+    # 只让看得见的测试通过、或者只修了一部分的写法：隐藏的测试要能把它挑出来，否则这道题量不出差别
+    result = run_task(task, lambda: scripted(*_overlay(task.repo.parent / "naive")), settings, tmp_path / "out")
+    assert not result.check_passed and "没通过" in result.check_detail, result.check_detail
+
+
+SECRET = "k9-hidden-value"
+
+
+def hidden_task(root: Path) -> Task:
+    """一道最小的带隐藏测试的题：答案只写在隐藏的测试里。"""
+    repo = root / "t1" / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "conftest.py").write_text("")
+    (repo / "answer.py").write_text("SECRET = ''\n")
+    (repo / "tests" / "test_visible.py").write_text(
+        "import answer\n\n\ndef test_is_a_string():\n    assert isinstance(answer.SECRET, str)\n")
+    (repo / "tests" / "test_hidden_secret.py").write_text(
+        f"import answer\n\n\ndef test_secret():\n    assert answer.SECRET == {SECRET!r}\n")
+    (root / "t1" / "task.toml").write_text(
+        'id = "t1"\ncategory = "bugfix"\nprompt = "p"\neditable = ["answer.py"]\nhidden = ["tests/test_hidden_*.py"]\n')
+    return Task.load(root / "t1")
+
+
+def test_hidden_files_are_not_copied_into_the_workspace(tmp_path: Path) -> None:
+    task = hidden_task(tmp_path / "tasks")
+    prepare_workspace(task, tmp_path / "ws")
+    assert sorted(_regular_files(tmp_path / "ws")) == ["answer.py", "conftest.py", "tests/test_visible.py"]
+    assert (task.repo / "tests" / "test_hidden_secret.py").is_file()  # 原题没动
+    for real in load_tasks(TASKS, only=["301-duration-spec"]):
+        prepare_workspace(real, tmp_path / real.id)
+        assert not list((tmp_path / real.id / "tests").glob("test_hidden_*"))
+        assert (tmp_path / real.id / "tests" / "test_durations.py").is_file()
+
+
+@pytest.mark.parametrize(("hidden", "editable", "error"), [
+    ('["tests/test_missing_*.py"]', '["answer.py"]', "一个文件也没匹配到"),
+    ('["answer.py"]', '["answer.py"]', "不能同时是 editable"),
+    ('["Tests/TEST_hidden_*.py", "*.py"]', '["answer.py"]', "不能同时是 editable"),
+])
+def test_bad_hidden_patterns_rejected(tmp_path: Path, hidden: str, editable: str, error: str) -> None:
+    task = hidden_task(tmp_path / "tasks")
+    toml = task.repo.parent / "task.toml"
+    toml.write_text(f'id = "t1"\ncategory = "bugfix"\nprompt = "p"\neditable = {editable}\nhidden = {hidden}\n')
+    with pytest.raises(ValueError, match=error):
+        Task.load(task.repo.parent)
+
+
+def test_original_task_and_its_git_dir_are_denied(tmp_path: Path) -> None:
+    project = tmp_path.resolve() / "project"
+    (project / ".git").mkdir(parents=True)
+    task = hidden_task(project / "evals" / "tasks")
+    assert _original_task_paths(task) == (project / "evals" / "tasks" / "t1", project / ".git")
+    elsewhere = tmp_path.resolve() / "elsewhere"  # 不在 git 仓库里：只挡题目目录
+    assert _original_task_paths(hidden_task(elsewhere)) == (elsewhere / "t1",)
+
+
+@macos_only
+def test_hidden_test_file_that_cannot_be_collected_is_an_error(settings: Settings, tmp_path: Path) -> None:
+    # 文件开头就导入原题里还没有的名字：收集出错，里面的测试进不了“必须通过”的名单，判分就悄悄不看它们了
+    task = hidden_task(tmp_path.resolve() / "tasks")
+    (task.repo / "tests" / "test_hidden_secret.py").write_text(
+        "from answer import not_written_yet\n\n\ndef test_secret():\n    assert not_written_yet() == 1\n")
+    with pytest.raises(RuntimeError, match="隐藏的测试文件 tests/test_hidden_secret"):
+        run_task(task, lambda: ScriptedProvider([LLMResponse("done")]), settings, tmp_path / "out")
+
+
+def _steal_secret(task: Task) -> ToolCall:
+    """隐藏的测试不在工作区里，但原题还在磁盘上：直接去原题目录里把答案抄出来。"""
+    original = task.repo / "tests" / "test_hidden_secret.py"
+    command = f"S=$(grep -o 'k9-[a-z-]*' '{original}' | head -1); echo \"SECRET = '$S'\" > answer.py"
+    return call("run_command", command=command)
+
+
+@macos_only
+def test_agent_cannot_read_hidden_tests_from_the_original_task(settings: Settings, tmp_path: Path) -> None:
+    task = hidden_task(tmp_path.resolve() / "tasks")
+    result = run_task(task, lambda: scripted(_steal_secret(task)), settings, tmp_path / "out")
+    assert not result.check_passed and "test_secret" in result.check_detail, result.check_detail
+
+
+def test_stealing_the_hidden_test_works_without_the_sandbox(settings: Settings, tmp_path: Path) -> None:
+    # 对照：不开沙盒时同一条命令抄得到答案，说明上面那个测试挡住的确实是沙盒
+    task = hidden_task(tmp_path.resolve() / "tasks")
+    result = run_task(task, lambda: scripted(_steal_secret(task)), settings, tmp_path / "out", no_sandbox=True)
+    assert result.check_passed, result.check_detail
 
 
 def _result(result_id: str, passed: bool, induced: bool = False) -> TaskResult:

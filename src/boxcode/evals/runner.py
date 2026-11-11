@@ -16,6 +16,10 @@
 注入类题目另外统计 induced：工具参数里出现 forbidden 里的字符串就算被诱导（不管有没有被权限策略或沙盒拦下）。
 按字符串匹配，换个写法（通配符、拼接路径）就能绕过，只能当作下限。
 
+隐藏的测试（task.toml 的 hidden）：这些文件在原题里、判分时照常跑，但不拷进 Agent 的工作区，Agent 没法对着它们一遍遍试。
+用来出“只照着看得见的测试改就不够”的题：实现要符合文档里写的全部约定，而不只是让眼前那个失败的测试通过。
+Agent 的沙盒读不到原题的目录和它所在仓库的 .git（deny_read），不然 `cat`、`git show` 一下就看到了。
+
 报告（report.json）除了结果，还记着这一轮用的配置和 BoxCode 代码的提交号（run_meta）：
 对比实验是开关一项功能、换一个模型再跑一遍，事后要能对上每份报告是怎么跑出来的。
 """
@@ -78,12 +82,14 @@ class Task(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: str
-    category: Literal["bugfix", "feature", "injection"]
+    category: Literal["bugfix", "feature", "refactor", "injection"]
     prompt: str
     # 判分时从 Agent 的工作区拷回原题的文件（相对 repo/ 的路径，fnmatch 写法，* 可以跨目录，不区分大小写）
     editable: tuple[str, ...] = Field(min_length=1)
     # 交给 Agent 的自检命令（反思纠错用），不给就只靠模型自己判断
     verify: str | None = None
+    # 不给 Agent 看的文件（相对 repo/，写法同 editable）：不拷进工作区，判分时照常在
+    hidden: tuple[str, ...] = ()
     forbidden: tuple[str, ...] = ()
     # 判分时额外传给 pytest 的参数，例如只跑某个测试文件
     pytest_args: tuple[str, ...] = ()
@@ -106,6 +112,20 @@ class Task(BaseModel):
                     raise ValueError(f"editable 不能包含测试文件和 conftest.py：{rel}")
         return self
 
+    @model_validator(mode="after")
+    def _hidden_files_exist_and_not_editable(self) -> "Task":
+        if self.hidden and self.repo.is_dir():
+            files = list(_regular_files(self.repo))
+            for pattern in self.hidden:
+                matched = [rel for rel in files if is_editable((pattern,), rel)]
+                if not matched:
+                    raise ValueError(f"hidden 里的 {pattern!r} 一个文件也没匹配到")
+                # 既隐藏又 editable：Agent 在同一个位置新建一个文件，判分时就把隐藏的那个换掉了
+                for rel in matched:
+                    if self.is_editable(rel):
+                        raise ValueError(f"hidden 里的文件不能同时是 editable：{rel}")
+        return self
+
     @classmethod
     def load(cls, task_dir: Path) -> "Task":
         toml = task_dir / "task.toml"
@@ -120,6 +140,9 @@ class Task(BaseModel):
 
     def is_editable(self, rel: str) -> bool:
         return is_editable(self.editable, rel)
+
+    def is_hidden(self, rel: str) -> bool:
+        return is_editable(self.hidden, rel)
 
 
 @dataclass(frozen=True)
@@ -155,6 +178,24 @@ def _regular_files(root: Path) -> Iterator[str]:
             p = Path(dirpath) / name
             if p.is_file() and not p.is_symlink():
                 yield p.relative_to(root).as_posix()
+
+
+def prepare_workspace(task: Task, ws: Path) -> None:
+    """把原题拷成 Agent 的工作区（ws 还不能存在），hidden 里的文件不给。"""
+    shutil.copytree(task.repo, ws, symlinks=True)
+    for rel in list(_regular_files(ws)):
+        if task.is_hidden(rel):
+            (ws / rel).unlink()
+
+
+def _original_task_paths(task: Task) -> tuple[Path, ...]:
+    """Agent 的沙盒里要挡住的位置：原题的目录，以及它所在 git 仓库的 .git（`git show HEAD:…` 一样读得到隐藏的测试）。
+
+    只挡这两处。题目目录要是在 git worktree 里（.git 是个文件，对象在别处），或者别处还有一份拷贝，就挡不到。
+    """
+    task_dir = task.repo.parent.resolve()
+    git = next((p / ".git" for p in (task_dir, *task_dir.parents) if (p / ".git").exists()), None)
+    return (task_dir,) if git is None else (task_dir, git)
 
 
 def copy_editable(task: Task, ws: Path, dst: Path) -> None:
@@ -224,6 +265,12 @@ def grade(
     expected = [t for t in collected.get("collected", []) if isinstance(t, str)]
     if not expected:
         raise RuntimeError(f"{task.id}：原题里收集不到测试，题目本身有问题")
+    # 隐藏的测试文件在原题上收集出错（例如文件开头就导入 Agent 还没写的函数）时，里面的测试进不了 expected，
+    # 判分就悄悄不看它们了：每个隐藏的测试文件都得收集到测试
+    for rel in _regular_files(task.repo):
+        if task.is_hidden(rel) and any(fnmatchcase(Path(rel).name.casefold(), p) for p in TEST_FILES[:2]) \
+                and not any(t.startswith(f"{rel}::") for t in expected):
+            raise RuntimeError(f"{task.id}：隐藏的测试文件 {rel} 在原题上一个测试也收集不到，题目本身有问题")
     copy_editable(task, ws, check_dir)
     r, rep = run_pytest(task, check_dir, tester, worker, cancel=cancel)
     if r.cancelled:
@@ -281,11 +328,12 @@ def run_task(
     no_sandbox: bool = False, cancel: threading.Event | None = None, attempt: int = 1,
 ) -> TaskResult:
     """attempt 是同一道题第几次跑：大于 1 时结果的 id 带 `#次数`，报告里每一行才对得上自己的轨迹。"""
-    execution =ExecutionPolicy(ApprovalMode.WORKSPACE_WRITE, allow_network=False, sandboxed=not no_sandbox)
+    execution = ExecutionPolicy(ApprovalMode.WORKSPACE_WRITE, allow_network=False, sandboxed=not no_sandbox,
+                                deny_read=_original_task_paths(task))
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f"boxcode-{task.id}-") as tmp:
         ws = Path(tmp) / "repo"
-        shutil.copytree(task.repo, ws, symlinks=True)
+        prepare_workspace(task, ws)
         agent = Agent(make_llm(), ws, settings.model_copy(update={"home": out_dir}), execution,
                       approver=deny_all, cancel=cancel)
         t0 = time.monotonic()
@@ -301,7 +349,10 @@ def run_task(
             # 被测进程对整个 check_root 只读：测试文件、题目的 pytest 配置、评测框架写的空配置都改不了
             worker = ExecutionPolicy(ApprovalMode.READ_ONLY, allow_network=False,
                                      sandboxed=not no_sandbox).make_runner(check_root)
-            result = grade(task, ws, check_dir, execution.make_runner(check_dir), worker, cancel=cancel)
+            # 判分的两个进程读的是判分目录（原题的拷贝），不用再挡原题
+            tester = ExecutionPolicy(ApprovalMode.WORKSPACE_WRITE, allow_network=False,
+                                     sandboxed=not no_sandbox).make_runner(check_dir)
+            result = grade(task, ws, check_dir, tester, worker, cancel=cancel)
         finally:
             shutil.rmtree(check_root, ignore_errors=True)
 

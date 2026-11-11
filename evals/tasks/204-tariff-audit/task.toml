@@ -1,0 +1,10 @@
+category = "bugfix"
+id = "204-tariff-audit"
+prompt = "tests/test_tariffs.py is failing: the grand total over the 14 country modules in tariffs/ is wrong. Each country module's docstring is its contract and is correct, but several modules do not implement their contract. Check every module against its own docstring and fix the code; do not change the docstrings or the tests. The visible test only checks one grand total; your work is graded by additional tests that you cannot see, which check every country separately."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["tariffs/*.py"]
+# 不给 Agent 看的测试：逐个国家核对
+hidden = ["tests/test_hidden_*.py"]
+verify = "python -m pytest -q"
+# 长上下文题：14 个模块各约 1 万字符，约定写成文字、每个模块的规则都不一样，搜不出来，只能逐个读；
+# 全部读一遍约 4.4 万 token，超过默认的压缩阈值（40000）。5 个模块各有一处和约定不符

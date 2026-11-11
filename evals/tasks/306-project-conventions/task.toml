@@ -1,0 +1,10 @@
+category = "feature"
+id = "306-project-conventions"
+prompt = "Add render_table and parse_table to tables.py as specified in docs/DESIGN.md, and follow the project rules in CONTRIBUTING.md. Make tests/test_tables.py pass without changing the tests. Your work is graded by additional tests that you cannot see: they check the behaviour in docs/DESIGN.md and run the project's own checker, tools/check_api.py."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["tables.py", "docs/API.md", "CHANGELOG.md"]
+# 不给 Agent 看的测试：DESIGN.md 里的行为，加上项目自己的规范检查
+hidden = ["tests/test_hidden_*.py"]
+verify = "python -m pytest -q && python tools/check_api.py"
+# 难题（多轮修正）：规范检查一次只报第一个问题。写完功能就停的话，自检每轮只能发现一个问题，两轮修正不够；
+# 要自己读 CONTRIBUTING.md、自己反复跑检查

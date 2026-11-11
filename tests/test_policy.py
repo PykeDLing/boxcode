@@ -94,6 +94,18 @@ def test_execution_policy_maps_mode_to_sandbox(workspace: Path, mode: ApprovalMo
     assert isinstance(ExecutionPolicy(mode, sandboxed=False).make_runner(workspace), NoSandboxRunner)
 
 
+def test_execution_policy_passes_extra_deny_read_to_sandbox(workspace: Path, tmp_path: Path) -> None:
+    # 评测用它挡住原题的目录；默认什么也不加
+    task_dir = (tmp_path / "task").resolve()
+    task_dir.mkdir()
+    if sys.platform == "darwin":
+        denied = ExecutionPolicy(deny_read=(task_dir,)).make_runner(workspace)
+        assert isinstance(denied, SeatbeltRunner) and f'(subpath "{task_dir}")' in denied.profile
+        plain = ExecutionPolicy().make_runner(workspace)
+        assert isinstance(plain, SeatbeltRunner) and str(task_dir) not in plain.profile
+    assert isinstance(ExecutionPolicy(sandboxed=False, deny_read=(task_dir,)).make_runner(workspace), NoSandboxRunner)
+
+
 def test_full_auto_allows_risky(workspace: Path) -> None:
     p = Policy(ApprovalMode.FULL_AUTO, workspace)
     assert p.check(Risk.EXEC, Target(command="curl x")).action is Action.ALLOW
