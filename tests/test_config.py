@@ -22,6 +22,8 @@ def test_from_env_parses_and_derives_model() -> None:
     assert s.max_turns == 5 and s.home == Path("/x/y") and s.runs_dir == Path("/x/y/runs") and s.effort == "max"
     assert Settings.from_env({"BOXCODE_MODEL": "qwen-max"}).model == "qwen-max"
     assert Settings(provider="anthropic").model == "claude-opus-5-5"
+    assert Settings().thinking == "default"
+    assert Settings.from_env({"BOXCODE_THINKING": "disabled"}).thinking == "disabled"
 
 
 def test_context_settings_from_env() -> None:
@@ -39,6 +41,7 @@ def test_context_settings_from_env() -> None:
     ({"BOXCODE_MAX_TURNS": "0"}, "BOXCODE_MAX_TURNS"),
     ({"BOXCODE_PROVIDER": "gemini"}, "BOXCODE_PROVIDER"),
     ({"BOXCODE_EFFORT": "ultra"}, "BOXCODE_EFFORT"),
+    ({"BOXCODE_THINKING": "off"}, "BOXCODE_THINKING"),
 ])
 def test_bad_values_name_the_variable(env: dict[str, str], var: str) -> None:
     with pytest.raises(ConfigError, match=var):

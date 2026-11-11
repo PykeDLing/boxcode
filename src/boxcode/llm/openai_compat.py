@@ -76,6 +76,8 @@ class OpenAICompatProvider:
             raise LLMUnavailable("没有 API key：写进 ~/.boxcode/api_key，或者设置 BOXCODE_API_KEY"
                                  "（用 Ollama 时随便填一个，例如 ollama）")
         self.name = settings.model
+        # thinking 不是 OpenAI 的标准参数，SDK 里只能放在 extra_body；default 时不带，不认识它的接口不受影响
+        self._extra_body = {"thinking": {"type": "disabled"}} if settings.thinking == "disabled" else None
         self._client = openai.OpenAI(base_url=settings.base_url, api_key=api_key, timeout=REQUEST_TIMEOUT_S)
 
     def complete(
@@ -89,6 +91,7 @@ class OpenAICompatProvider:
                 model=self.name,
                 messages=convert_messages(messages),  # type: ignore[arg-type]
                 tools=convert_tools(tools),  # type: ignore[arg-type]
+                extra_body=self._extra_body,
             )
         except openai.OpenAIError as e:
             raise LLMUnavailable(str(e)) from e

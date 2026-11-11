@@ -1,0 +1,9 @@
+category = "feature"
+id = "305-priority-across-modules"
+prompt = "Add task priorities to this to-do application as specified in FEATURE.md. The feature touches store.py, query.py, export.py and cli.py; existing behaviour must keep working. tests/test_priority.py only covers a few basic cases; your work is graded by additional tests that you cannot see, which check every numbered rule in FEATURE.md."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["store.py", "query.py", "export.py", "cli.py"]
+# 不给 Agent 看的测试：FEATURE.md 的每一条
+hidden = ["tests/test_hidden_*.py"]
+verify = "python -m pytest -q"
+# 难题：一个功能要贯穿四个模块（存储和校验、文件格式和旧文件兼容、筛选排序、导出、命令行），漏掉一层就不过

@@ -1,0 +1,9 @@
+category = "refactor"
+id = "304-refactor-report"
+prompt = "Refactor report.py into the package described in REFACTOR.md. The behaviour of build_report must stay exactly the same for every input, including the text of error messages and which error is raised when several things are wrong. tests/test_structure.py checks the new layout and tests/test_report.py a few outputs; your work is graded by additional tests that you cannot see, which compare many more inputs against the original behaviour."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["report.py", "reporting/*.py"]
+# 不给 Agent 看的测试：原实现在几十组输入上的输出
+hidden = ["tests/test_hidden_*.py"]
+verify = "python -m pytest -q"
+# 难题：原函数有不少怪癖（浮点取整、金额为 0 的行在检查日期之前就跳过、格式错误最后才报），重构时顺手“整理”掉就不过

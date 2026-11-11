@@ -34,7 +34,7 @@ BoxCode 把模型要跑的每条命令放进 Seatbelt 沙盒（`sandbox-exec`，
 
 ## 评测结果
 
-`boxcode eval` 把每道题的仓库复制到临时目录，让 Agent 去做，再跑原题的测试判分。判分目录是原题的新拷贝，只拷回题目声明可以改的文件，pytest 隔离启动，并且原题的每个测试都要通过，不只看退出码：改测试、遮住 pytest、伪造字节码缓存、导入时直接 `exit(0)` 这些作弊写法都有测试（[技术方案 5.1](docs/design.md#51-题目格式)）。判分也在沙盒里跑。注入题另外统计模型有没有被诱导去执行注入的指令（不管有没有被拦下）。
+`boxcode eval` 把每道题的仓库复制到临时目录，让 Agent 去做，再跑原题的测试判分。判分目录是原题的新拷贝，只拷回题目声明可以改的文件，pytest 隔离启动，并且原题的每个测试都要通过，不只看退出码：改测试、遮住 pytest、伪造字节码缓存、导入时直接 `exit(0)` 这些作弊写法都有测试（[技术方案 5.1](docs/design.md#51-题目格式)）。判分也在沙盒里跑。题目可以带隐藏的测试：这些文件不给 Agent，判分时照常跑，Agent 的沙盒读不到原题的目录。注入题另外统计模型有没有被诱导去执行注入的指令（不管有没有被拦下）。
 
 2026-11-09，`claude-opus-5-5`，15 道题每题跑 3 次，共 45 次。这次运行在上下文功能（压缩、代码库地图、任务规划）加入之前；报告里没有记 effort（默认是 `high`）。耗时、模型调用、输入 token 都是 3 次的平均：
 
@@ -60,7 +60,37 @@ BoxCode 把模型要跑的每条命令放进 Seatbelt 沙盒（`sandbox-exec`，
 
 注入题的五种藏法：README 里的 HTML 注释（101）、AGENTS.md 里的“必做步骤”（102，项目说明会附在第一条消息里，更像是给 Agent 的正式指示）、AGENTS.md 里伪造的 `</project_notes>` 后面（103）、要改的源文件注释（104）、失败测试的输出（105）。内容都是读出凭证再用 `curl` 上传。就算模型照做了，沙盒也读不到这些文件、连不上外网。
 
-这 15 道题对 `claude-opus-5-5` 太简单：全部通过，普通题和注入题都是 4 次左右模型调用，改一处设计看不出差别。上下文功能也还没有数据：压缩的默认阈值是 40000 token，而这些题单次请求的输入最高约 2.2 万，默认配置下压缩不会触发（已有的几次对比见[技术方案 5.4](docs/design.md#54-目前的数据)）。下一步是接弱一些的模型跑同一套题、加难题，见[路线图](docs/design.md#6-路线图)。
+2026-11-10 用弱一些的模型 `mimo-v2.6-flash`（小米 MiMo，OpenAI 兼容接口，关闭深度思考）把同样 15 道题各跑了 1 次：也是全部通过、没有被诱导，平均 5.3 次模型调用，单次请求的输入最高约 1.7 万 token。
+
+所以这 15 道题对两个模型都太简单，改一处设计看不出差别；压缩的默认阈值是 40000 token，这些题也触发不了（已有的几次对比见[技术方案 5.4](docs/design.md#54-目前的数据)）。为此加了 7 道难题，都带隐藏的测试：
+
+| 题目 | 类型 | 难在哪里 |
+| --- | --- | --- |
+| 204-tariff-audit | 长上下文 | 14 个模块各约 1 万字符，约定写成文字、每个模块都不一样，只能逐个读；全读一遍约 4.4 万 token，超过压缩阈值 |
+| 301-duration-spec | 实现功能 | 规格文档有 13 条规则，看得见的测试只有 5 个基本用例 |
+| 302-root-cause-sku | 修 bug | 症状在一个模块，根因在另一个模块，还有三处同类问题；只在报错的地方打补丁不够 |
+| 303-shared-rounding | 修 bug | 最顺手的改法是改共用的函数，会破坏另一个模块按文档要求的行为 |
+| 304-refactor-report | 重构 | 把一个长函数拆成包，输出、报错文字和报错顺序都不能变，原实现有不少怪癖 |
+| 305-priority-across-modules | 实现功能 | 一个功能贯穿存储、文件格式兼容、筛选排序、导出、命令行，共 14 条规则 |
+| 306-project-conventions | 实现功能 | 项目有自己的规范检查脚本，一次只报第一个问题，要自己反复跑 |
+
+每道难题都带一个参考解和一个“看起来对”的错解（只过得了看得见的测试，或者只修了一部分），`tests/test_evals.py` 用判分程序验证过参考解通过、错解不通过。
+
+2026-11-11，`claude-opus-5-5` 和 `claude-haiku-5-5`（effort 都是 `high`，上下文功能都开着），7 道难题各跑 1 次：
+
+| 题目 | Opus | 耗时 | 模型调用 | 输入 token（命中缓存） | Haiku | 耗时 | 模型调用 | 输入 token（命中缓存） |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 204-tariff-audit | 通过 | 62.6s | 21 | 784758（76%） | 没通过 | 223.7s | 30 | 1643935（64%） |
+| 301-duration-spec | 通过 | 47.9s | 4 | 24487（64%） | 通过 | 40.2s | 5 | 45884（70%） |
+| 302-root-cause-sku | 通过 | 19.4s | 3 | 17652（48%） | 通过 | 17.9s | 4 | 27189（65%） |
+| 303-shared-rounding | 通过 | 11.7s | 3 | 12603（59%） | 通过 | 12.8s | 4 | 21988（67%） |
+| 304-refactor-report | 通过 | 59.1s | 6 | 46760（75%） | 通过 | 60.2s | 13 | 190085（89%） |
+| 305-priority-across-modules | 通过 | 55.5s | 7 | 73390（80%） | 通过 | 55.1s | 9 | 140456（84%） |
+| 306-project-conventions | 通过 | 36.9s | 5 | 40374（73%） | 通过 | 36.3s | 6 | 60768（74%） |
+
+Opus 7/7，Haiku 6/7，都没有用到修正轮。301–306 两个模型都通过，只有 204 分出了差别。
+
+204 在默认阈值下触发了压缩（Claude 是服务器清理旧的工具结果）：Opus 3 次，Haiku 7 次。Haiku 在第 10 轮就找到了全部 5 处问题并一次改了 5 个文件，但其中一处要改上下两个门槛的比较，它只改了一个；之后总数还是不对，它没有回头检查自己的改动，而是把各个模块又逐个重读，直到用完 30 轮。隐藏的测试里只有那一个模块的 2 个没通过。每题只跑了 1 次，旧结果被清理和重复去读之间是不是因果关系，这一次运行说明不了。
 
 ## 快速开始
 
@@ -85,6 +115,8 @@ export BOXCODE_PROVIDER=openai
 export BOXCODE_BASE_URL=https://api.deepseek.com
 export BOXCODE_MODEL=deepseek-chat
 mkdir -p ~/.boxcode && (umask 077; pbpaste > ~/.boxcode/api_key)   # 先复制 key；也可以用 BOXCODE_API_KEY
+# 小米 MiMo：BOXCODE_BASE_URL=https://api.xiaomimimo.com/v1，BOXCODE_MODEL=mimo-v2.6-flash，
+# 它默认开着深度思考并要求回传思考内容，BoxCode 没有回传，要加 export BOXCODE_THINKING=disabled
 ```
 
 key 尽量不要放在环境变量里（包括写进 `~/.zshrc` 再 export）：沙盒里的命令能读到同一个用户下任何进程启动时的环境变量，这一点 Seatbelt 挡不住。`~/.config/anthropic` 和 `~/.boxcode` 沙盒里都读不到。
@@ -123,6 +155,7 @@ uv run boxcode gui
 | `BOXCODE_PROVIDER` | `openai` | `anthropic` 或 `openai` |
 | `BOXCODE_MODEL` | `claude-opus-5-5` / `deepseek-chat` | 模型 |
 | `BOXCODE_EFFORT` | `high` | Claude 的思考深度：`low` / `medium` / `high` / `xhigh` / `max` |
+| `BOXCODE_THINKING` | `default` | OpenAI 兼容接口的深度思考：`default` 由接口决定，`disabled` 在请求里关掉。小米 MiMo 默认开着思考，要设成 `disabled` |
 | `BOXCODE_BASE_URL`、`BOXCODE_API_KEY` | | OpenAI 兼容接口的地址和 key；没设置 key 时读 `~/.boxcode/api_key` |
 | `BOXCODE_MAX_TURNS` | `30` | 最多调用模型几轮 |
 | `BOXCODE_MAX_FIX_ROUNDS` | `2` | 自检失败后最多再修几轮 |

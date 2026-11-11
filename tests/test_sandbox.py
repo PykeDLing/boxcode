@@ -143,6 +143,27 @@ def test_cannot_read_private_files(workspace: Path, tmp_path: Path, rel: str) ->
 
 
 @macos_only
+def test_extra_deny_read(workspace: Path, tmp_path: Path) -> None:
+    # 评测时挡住原题的目录：隐藏的测试在里面。内容读不到，目录也列不出来；别的位置照常能读
+    task_dir = (tmp_path / "task").resolve()
+    (task_dir / "tests").mkdir(parents=True)
+    (task_dir / "tests" / "test_hidden_x.py").write_text("HIDDEN_ASSERTION")
+    other = (tmp_path / "other").resolve()
+    other.mkdir()
+    (other / "a.txt").write_text("VISIBLE")
+    link = tmp_path / "link-to-task"
+    link.symlink_to(task_dir)
+    command = (f"cat '{task_dir}/tests/test_hidden_x.py'; ls '{task_dir}/tests'; cat '{link}/tests/test_hidden_x.py'; "
+               f"cp -R '{task_dir}' copy; ls copy/tests; cat '{other}/a.txt'")
+    for deny in ((task_dir,), (link,)):  # 给的是符号链接时，挡的是它指向的真实位置
+        r = SeatbeltRunner(workspace, deny_read=deny).run(command, workspace, 10)
+        assert "HIDDEN_ASSERTION" not in r.stdout and "test_hidden_x.py" not in r.stdout
+        assert "VISIBLE" in r.stdout
+    allowed = SeatbeltRunner(workspace).run(command, workspace, 10)
+    assert "HIDDEN_ASSERTION" in allowed.stdout  # 对照：不加这一条时读得到
+
+
+@macos_only
 def test_dotenv_readable_only_inside_workspace(workspace: Path, tmp_path: Path) -> None:
     other = (tmp_path / "other-project").resolve()
     other.mkdir()

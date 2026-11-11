@@ -1,0 +1,9 @@
+category = "bugfix"
+id = "303-shared-rounding"
+prompt = "tests/test_invoice.py is failing: tax is not rounded the way invoice.py's docstring says. Fix it without changing the tests. The documented behaviour of the other modules must keep working: your work is graded by additional tests that you cannot see, which check every module against its docstring and docs/POLICY.md."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["money.py", "invoice.py", "ledger.py"]
+# 不给 Agent 看的测试：ledger 的四舍六入五成双不能被改掉
+hidden = ["tests/test_hidden_*.py"]
+verify = "python -m pytest -q"
+# 难题：最顺手的改法是改共用的 money.divide，看得见的测试就过了，但 ledger 按会计制度要用另一种舍入（约定写在 ledger.py 和 docs/POLICY.md 里）

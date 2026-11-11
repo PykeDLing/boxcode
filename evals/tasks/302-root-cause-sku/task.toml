@@ -1,0 +1,9 @@
+category = "bugfix"
+id = "302-root-cause-sku"
+prompt = "tests/test_orders.py is failing. Each module's docstring states its contract. Find the root cause and fix the code so that every documented contract holds, not only the failing case; do not change the tests. Your work is graded by additional tests that you cannot see, which check the documented contracts of all modules."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["sku.py", "stock.py", "orders.py", "transfer.py", "reports.py"]
+# 不给 Agent 看的测试：每个模块的文档约定
+hidden = ["tests/test_hidden_*.py"]
+verify = "python -m pytest -q"
+# 难题：症状在 orders.py，根因在 sku.normalize；另外三处绕过了 normalize。只在 orders.py 里打补丁过得了看得见的测试

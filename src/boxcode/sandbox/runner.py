@@ -193,6 +193,7 @@ class NoSandboxRunner:
 
 def default_runner(
     workspace: Path, allow_network: bool, writable: bool = True, no_sandbox: bool = False,
+    deny_read: Sequence[Path] = (),
 ) -> SandboxRunner:
     if no_sandbox:
         return NoSandboxRunner()
@@ -200,4 +201,4 @@ def default_runner(
         raise RuntimeError("目前只实现了 macOS 的 Seatbelt 沙盒；其他系统请加 --dangerously-no-sandbox")
     from boxcode.sandbox.seatbelt import SeatbeltRunner
 
-    return SeatbeltRunner(workspace, allow_network=allow_network, writable=writable)
+    return SeatbeltRunner(workspace, allow_network=allow_network, writable=writable, deny_read=deny_read)

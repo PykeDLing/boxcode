@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 from openai.types.chat import ChatCompletion
 
-from boxcode.config import Settings
+from boxcode.config import Settings, Thinking
 from boxcode.llm.base import (
     AssistantMessage,
     LLMUnavailable,
@@ -79,6 +79,22 @@ def test_length_means_truncated_tool_call(monkeypatch: pytest.MonkeyPatch) -> No
 def test_content_filter_is_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
     r = provider(monkeypatch, completion("content_filter")).complete([UserMessage("x")], [])
     assert r.stop_reason is StopReason.REFUSAL
+
+
+def test_thinking_disabled_only_when_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 小米 MiMo 默认开思考，不回传 reasoning_content 会报 400：能在请求里关掉。默认不带这个参数
+    sent: list[dict[str, Any]] = []
+
+    def create(**kwargs: Any) -> ChatCompletion:
+        sent.append(kwargs)
+        return completion("stop", content="ok")
+
+    options: tuple[Thinking, ...] = ("default", "disabled")
+    for thinking in options:
+        p = OpenAICompatProvider(Settings(api_key="k", thinking=thinking))
+        monkeypatch.setattr(p._client.chat.completions, "create", create)
+        p.complete([UserMessage("x")], [])
+    assert [k["extra_body"] for k in sent] == [None, {"thinking": {"type": "disabled"}}]
 
 
 def test_missing_key_and_empty_choices(monkeypatch: pytest.MonkeyPatch) -> None:

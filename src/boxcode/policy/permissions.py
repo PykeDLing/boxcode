@@ -28,6 +28,8 @@ class ExecutionPolicy:
     mode: ApprovalMode = ApprovalMode.WORKSPACE_WRITE
     allow_network: bool = False
     sandboxed: bool = True  # False 就是 --dangerously-no-sandbox
+    # 沙盒里额外读不到的位置（评测时是原题的目录）。不开沙盒时不起作用
+    deny_read: tuple[Path, ...] = ()
 
     @property
     def workspace_writable(self) -> bool:
@@ -35,7 +37,7 @@ class ExecutionPolicy:
 
     def make_runner(self, workspace: Path) -> SandboxRunner:
         return default_runner(workspace, allow_network=self.allow_network, writable=self.workspace_writable,
-                              no_sandbox=not self.sandboxed)
+                              no_sandbox=not self.sandboxed, deny_read=self.deny_read)
 
 
 # 不能当工作区的系统目录（含它们下面的目录）：沙盒放行整个工作区的写入，/Applications、/opt/homebrew

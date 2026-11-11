@@ -6,6 +6,7 @@
     否则把工作区整个挪到 /tmp、改完 .git 再挪回来就绕过去了
 - 读：挡住 SSH、GPG、云服务凭证、shell 配置和历史、浏览器和其他 App 的数据、工作区外的 .env，
   以及 BoxCode 自己的执行轨迹；这些位置如果是符号链接，链接指向的真实位置也挡。这是黑名单，工作区外的其他文件仍然读得到
+  （调用方可以再加几个位置，deny_read：评测时把原题的目录挡上，Agent 读不到隐藏的测试）
 - 进程间通信：只能连工作区和这个沙盒自己的临时目录里的 unix 套接字（别的程序的 ssh-agent、浏览器、Docker 都连不上）；
   不能通过 LaunchServices 打开程序（`open` 起来的程序不在沙盒里）、不能发 Apple 事件、不能写别的程序的偏好设置、
   不能读写剪贴板、不能找钥匙串服务、不能给沙盒外的进程发信号
@@ -95,10 +96,13 @@ def _subpaths(paths: Iterable[Path | str]) -> str:
 
 def make_profile(
     workspace: Path, home: Path, allow_network: bool, writable_workspace: bool = True,
-    socket_dirs: Iterable[Path] = (),
+    socket_dirs: Iterable[Path] = (), deny_read: Iterable[Path] = (),
 ) -> str:
     ws = canonical(workspace)
     home = canonical(home)
+    # 调用方额外要挡的位置（评测时是原题的目录：隐藏的测试在里面）。和上面的黑名单一样只挡内容，目录也列不出来
+    extra = [canonical(p) for p in deny_read]
+    extra_reads = f"(deny file-read-data\n{_subpaths(extra)})\n" if extra else ""
     writable = "\n".join([
         _subpaths((ws, *SYSTEM_WRITABLE)),
         *(f"  (literal {_q(p)})" for p in DEV_WRITABLE),
@@ -126,7 +130,7 @@ def make_profile(
 {_subpaths(_private_paths(home))})
 (deny file-read-data
   (require-all (regex {DOTENV_REGEX}) (require-not (subpath {_q(ws)}))))
-
+{extra_reads}
 (deny network-outbound (remote unix-socket))
 {sockets}
 (deny appleevent-send)
@@ -144,6 +148,7 @@ class SeatbeltRunner:
 
     def __init__(
         self, workspace: Path, allow_network: bool = False, home: Path | None = None, writable: bool = True,
+        deny_read: Iterable[Path] = (),
     ) -> None:
         self.workspace = canonical(workspace)
         # 这个沙盒自己的临时目录：命令的 TMPDIR 指向这里，只有这里和工作区的 unix 套接字连得上
@@ -152,7 +157,7 @@ class SeatbeltRunner:
         self.tmpdir = canonical(Path(tempfile.mkdtemp(prefix="bx-", dir=SHORT_TMP)))
         weakref.finalize(self, shutil.rmtree, self.tmpdir, ignore_errors=True)
         self.profile = make_profile(self.workspace, home or Path.home(), allow_network, writable,
-                                    socket_dirs=(self.tmpdir,))
+                                    socket_dirs=(self.tmpdir,), deny_read=deny_read)
 
     def run(
         self, command: str, cwd: Path, timeout_s: float, *,

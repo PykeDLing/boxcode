@@ -1,0 +1,9 @@
+category = "feature"
+id = "301-duration-spec"
+prompt = "Implement parse_duration and format_duration in durations.py exactly as specified in SPEC.md. tests/test_durations.py only covers a few basic cases; your work is graded by additional tests that you cannot see, which check every numbered rule in SPEC.md."
+# 判分时只把这些文件从 Agent 的工作区拷回原题，其余一律用原题的版本
+editable = ["durations.py"]
+# 不给 Agent 看的测试：每条规则至少一个用例
+hidden = ["tests/test_hidden_*.py"]
+verify = "python -m pytest -q"
+# 难题：看得见的测试只有几个基本用例，规格里有 13 条规则（顺序、空白、小数、精确运算、上限……），漏一条就不过
