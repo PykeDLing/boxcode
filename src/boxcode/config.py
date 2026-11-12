@@ -33,6 +33,7 @@ ENV_VARS: dict[str, str] = {
     "api_key": "BOXCODE_API_KEY",
     "effort": "BOXCODE_EFFORT",
     "thinking": "BOXCODE_THINKING",
+    "stream": "BOXCODE_STREAM",
     "home": "BOXCODE_HOME",
     "max_turns": "BOXCODE_MAX_TURNS",
     "max_fix_rounds": "BOXCODE_MAX_FIX_ROUNDS",
@@ -65,6 +66,9 @@ class Settings(BaseModel):
     # OpenAI 兼容接口的深度思考：default 不带这个参数，由接口自己决定；disabled 在请求里关掉。
     # 小米 MiMo 默认开着思考，并且要求把 reasoning_content 原样传回，BoxCode 没有回传，不关会报 400
     thinking: Thinking = "default"
+    # OpenAI 兼容接口用不用流式输出。流式时按停止能中途断开连接，剩下的输出不再生成；
+    # 有的兼容接口流式的工具调用不完整、或者不认识 stream_options，这时关掉。Claude 一直是流式，不看这一项
+    stream: bool = True
     # 执行轨迹存在这里，不写进工作区
     home: Path = Field(default_factory=lambda: Path.home() / ".boxcode")
     max_turns: int = Field(default=30, ge=1)

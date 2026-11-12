@@ -88,7 +88,7 @@ BoxCode 把模型要跑的每条命令放进 Seatbelt 沙盒（`sandbox-exec`，
 | 305-priority-across-modules | 通过 | 55.5s | 7 | 73390（80%） | 通过 | 55.1s | 9 | 140456（84%） |
 | 306-project-conventions | 通过 | 36.9s | 5 | 40374（73%） | 通过 | 36.3s | 6 | 60768（74%） |
 
-Opus 7/7，Haiku 6/7，都没有用到修正轮。301–306 两个模型都通过，只有 204 分出了差别。
+Opus 7/7，Haiku 6/7，都没有用到修正轮。301–306 两个模型都通过，只有 204 上 Haiku 没通过。这是每题 1 次的结果：2026-11-12 Haiku 又把 204 跑了 9 次，9 次都通过，所以 204 也只是偶尔难住 Haiku（[技术方案 5.4](docs/design.md#54-目前的数据)）。
 
 204 在默认阈值下触发了压缩（Claude 是服务器清理旧的工具结果）：Opus 3 次，Haiku 7 次。Haiku 在第 10 轮就找到了全部 5 处问题并一次改了 5 个文件，但其中一处要改上下两个门槛的比较，它只改了一个；之后总数还是不对，它没有回头检查自己的改动，而是把各个模块又逐个重读，直到用完 30 轮。隐藏的测试里只有那一个模块的 2 个没通过。每题只跑了 1 次，旧结果被清理和重复去读之间是不是因果关系，这一次运行说明不了。
 
@@ -163,6 +163,7 @@ uv run boxcode gui
 | `BOXCODE_MODEL` | `claude-opus-5-5` / `deepseek-chat` | 模型 |
 | `BOXCODE_EFFORT` | `high` | Claude 的思考深度：`low` / `medium` / `high` / `xhigh` / `max` |
 | `BOXCODE_THINKING` | `default` | OpenAI 兼容接口的深度思考：`default` 由接口决定，`disabled` 在请求里关掉。小米 MiMo 默认开着思考，要设成 `disabled` |
+| `BOXCODE_STREAM` | `true` | OpenAI 兼容接口用不用流式输出。流式时按停止会断开连接，服务器不再往下生成；接口的流式工具调用不完整时设成 `false` |
 | `BOXCODE_BASE_URL`、`BOXCODE_API_KEY` | | OpenAI 兼容接口的地址和 key；没设置 key 时读 `~/.boxcode/api_key` |
 | `BOXCODE_MAX_TURNS` | `30` | 最多调用模型几轮 |
 | `BOXCODE_MAX_FIX_ROUNDS` | `2` | 自检失败后最多再修几轮 |
