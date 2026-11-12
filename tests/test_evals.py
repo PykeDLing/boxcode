@@ -710,6 +710,8 @@ def test_failed_run_gets_a_cause(settings: Settings, tmp_path: Path, calls: list
     assert (result.failure, detail in result.failure_detail) == (failure, True), result.failure_detail
     assert result.failed_tests and all(t.startswith("tests/test_stats.py::") for t in result.failed_tests)
     assert result.changed_files == (["stats.py"] if failure == "verify_failed" else [])
+    # 用了几轮修正记在结果里：对比有无反思纠错（compare.py）时看它
+    assert result.fix_rounds == (settings.max_fix_rounds if status == "verify_failed" else 0)
 
 
 @macos_only
