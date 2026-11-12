@@ -24,6 +24,8 @@ def test_from_env_parses_and_derives_model() -> None:
     assert Settings(provider="anthropic").model == "claude-opus-5-5"
     assert Settings().thinking == "default"
     assert Settings.from_env({"BOXCODE_THINKING": "disabled"}).thinking == "disabled"
+    # 流式默认开；有的兼容接口流式不完整，可以关
+    assert Settings().stream is True and Settings.from_env({"BOXCODE_STREAM": "false"}).stream is False
 
 
 def test_context_settings_from_env() -> None:

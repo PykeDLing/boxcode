@@ -236,7 +236,7 @@ class Agent:
         """在单独的线程里调模型，按了停止就不再等它，抛 LLMCancelled。
 
         模型接口是阻塞的网络请求（Claude 一次回复可能要几分钟），在当前线程里调，停止要等它返回才生效。
-        放弃的请求留在后台线程里：Provider 支持的话（Claude 的流式接口）会看到 cancel、立刻断开连接，
+        放弃的请求留在后台线程里：Provider 支持的话（流式接口）会看到 cancel、断开连接，
         不支持的等它自己结束，结果丢掉。对话历史传一份拷贝，后台线程不会读到之后的修改。
         """
         outcome: list[LLMResponse | BaseException] = []
