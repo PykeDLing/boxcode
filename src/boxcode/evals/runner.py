@@ -174,6 +174,8 @@ class TaskResult:
     changed_files: list[str] = field(default_factory=list)
     # 判分时没通过的测试（check_detail 里只列前几个）
     failed_tests: list[str] = field(default_factory=list)
+    # 用了几轮修正（自检没过、把输出交回模型再改）。对比有无反思纠错时看它
+    fix_rounds: int = 0
 
 
 @dataclass(frozen=True)
@@ -369,8 +371,10 @@ def run_task(
         agent = Agent(make_llm(), ws, settings.model_copy(update={"home": out_dir}), execution,
                       approver=deny_all, cancel=cancel)
         t0 = time.monotonic()
+        fix_rounds = 0
         try:
-            status = agent.run(task.prompt, verify_command=task.verify).status
+            run = agent.run(task.prompt, verify_command=task.verify)
+            status, fix_rounds = run.status, run.fix_rounds
         except Exception:  # Agent.run 不该抛出；万一抛了，也不能让整轮评测停下
             status = Status.CRASHED
         seconds = round(time.monotonic() - t0, 2)
@@ -400,7 +404,7 @@ def run_task(
         seconds=seconds, summary=agent.trace.summary(),
         trace_path=str(agent.trace.path) if agent.trace.path else None,
         failure=why.cause.value if why else None, failure_detail=why.detail if why else "",
-        changed_files=changed, failed_tests=list(result.failed),
+        changed_files=changed, failed_tests=list(result.failed), fix_rounds=fix_rounds,
     )
 
 

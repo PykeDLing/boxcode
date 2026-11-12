@@ -1,4 +1,4 @@
-"""命令行：boxcode run "任务" / boxcode eval / boxcode gui。"""
+"""命令行：boxcode run "任务" / boxcode eval / boxcode compare / boxcode gui。"""
 
 import json
 from functools import partial
@@ -184,6 +184,95 @@ def eval_cmd(
                              str(t["avg_tokens"]))
         console.print(per_task)
     console.print(f"[dim]报告：{escape(str(run_dir / 'report.json'))}[/]")
+
+
+def _cause_label(cause: str) -> str:
+    from boxcode.evals import LABELS, Cause
+
+    try:
+        return LABELS[Cause(cause)]
+    except ValueError:  # 比这份代码新的报告里的原因
+        return cause
+
+
+def _signed(value: float, digits: int = 2) -> str:
+    return f"{value:+.{digits}f}".rstrip("0").rstrip(".") if value else "0"
+
+
+@app.command("compare")
+def compare_cmd(
+    a: Annotated[str, typer.Argument(help="基准那一轮：结果目录下的名字（例如 20261111-133446），或者报告的路径")],
+    b: Annotated[str, typer.Argument(help="换了配置的那一轮")],
+    out: Annotated[Path, typer.Option(help="结果目录")] = Path("evals/results"),
+) -> None:
+    """对比两轮评测：配置差在哪、指标差多少、通过率的差别是不是可能只是随机波动。"""
+    from boxcode.evals import compare, describe_p, load_report
+
+    def path_of(name: str) -> Path:
+        return Path(name) if Path(name).exists() else out / name
+
+    try:
+        report_a, report_b = load_report(path_of(a)), load_report(path_of(b))
+        result = compare(report_a, report_b)
+    except ValueError as e:
+        raise fail(str(e)) from e
+    ta, tb = result.total_a, result.total_b
+    for name, arg, rep, side in (("A", a, report_a, ta), ("B", b, report_b, tb)):
+        console.print(f"{name}：{arg}  {rep.get('model') or '（没记模型）'}  {side.runs} 次", markup=False)
+
+    if result.config_diff:
+        config = Table("不一样的配置", "A", "B")
+        for key, value_a, value_b in result.config_diff:
+            config.add_row(key, *("（没记）" if v is None else escape(json.dumps(v, ensure_ascii=False))
+                                  for v in (value_a, value_b)))
+        console.print(config)
+
+    def share(yes: int, total: int) -> str:
+        return f"{yes}/{total}（{yes / total:.0%}）" if total else "—"
+
+    metrics = Table("指标", "A", "B", "B − A")
+    metrics.add_row("通过", share(ta.passed, ta.runs), share(tb.passed, tb.runs),
+                    f"{_signed((tb.pass_rate - ta.pass_rate) * 100, 1)} 个百分点")
+    if ta.injection_runs or tb.injection_runs:
+        metrics.add_row("注入题里被诱导", share(ta.induced, ta.injection_runs),
+                        share(tb.induced, tb.injection_runs), "")
+    metrics.add_row("平均模型调用", str(ta.avg_llm_calls), str(tb.avg_llm_calls),
+                    _signed(tb.avg_llm_calls - ta.avg_llm_calls))
+    metrics.add_row("平均 token", str(ta.avg_tokens), str(tb.avg_tokens), _signed(tb.avg_tokens - ta.avg_tokens))
+    metrics.add_row("平均耗时（秒）", str(ta.avg_seconds), str(tb.avg_seconds),
+                    _signed(tb.avg_seconds - ta.avg_seconds, 1))
+    if ta.avg_fix_rounds is not None and tb.avg_fix_rounds is not None:
+        metrics.add_row("平均修正轮数", str(ta.avg_fix_rounds), str(tb.avg_fix_rounds),
+                        _signed(tb.avg_fix_rounds - ta.avg_fix_rounds))
+    if ta.interrupted or tb.interrupted:
+        metrics.add_row("没跑完", str(ta.interrupted), str(tb.interrupted), "")
+    console.print(metrics)
+
+    causes = dict.fromkeys([*ta.failures, *tb.failures])
+    if causes:
+        failures = Table("没通过的原因", "A", "B")
+        for cause in causes:
+            failures.add_row(_cause_label(cause), str(ta.failures.get(cause, 0)), str(tb.failures.get(cause, 0)))
+        console.print(failures)
+
+    if len(result.per_task) > 1:
+        # 每格写成“A → B”：一格一列的话 80 列的终端放不下，题目的名字会被截掉
+        per_task = Table(caption="每格是 A → B；调用和 token 是每次运行的平均", caption_justify="left")
+        per_task.add_column("题目", no_wrap=True)
+        for header in ("通过", "模型调用", "token"):
+            per_task.add_column(header)
+        for row in result.per_task:
+            differs = row.a.pass_rate != row.b.pass_rate  # 通过情况不一样的题标出来
+            per_task.add_row(row.id, f"{row.a.passed}/{row.a.runs} → {row.b.passed}/{row.b.runs}",
+                             f"{row.a.avg_llm_calls} → {row.b.avg_llm_calls}",
+                             f"{row.a.avg_tokens} → {row.b.avg_tokens}", style="yellow" if differs else None)
+        console.print(per_task)
+
+    console.print(f"通过率的差别：{describe_p(result.pass_p)}", markup=False)
+    if result.induced_p is not None:
+        console.print(f"诱导率的差别：{describe_p(result.induced_p)}", markup=False)
+    for note in result.notes:
+        console.print(f"[yellow]注意[/]：{escape(note)}")
 
 
 @app.command()

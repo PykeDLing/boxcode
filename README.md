@@ -133,6 +133,10 @@ uv run boxcode eval --repeat 3 --jobs 4
 
 # 对比实验：用环境变量换一项配置再跑一遍，例如系统提示里去掉 security 这一段
 BOXCODE_PROMPT_SKIP=security uv run boxcode eval --repeat 3
+
+# 比两轮评测（结果目录下的名字，或者报告的路径）：配置差在哪、各项指标差多少、
+# 通过率的差别是不是可能只是随机波动
+uv run boxcode compare 20261111-133446 20261111-134217
 ```
 
 每次运行的执行轨迹（每一步一行 JSON）存在 `~/.boxcode/runs/`，沙盒里的命令读不到。
@@ -221,7 +225,7 @@ src/boxcode/
   policy/    权限策略
   sandbox/   Seatbelt 规则生成与执行
   trace/     执行轨迹（JSONL）
-  evals/     评测框架：判分、失败归因
+  evals/     评测框架：判分、失败归因、两份报告的对比
   gui/       桌面界面：pywebview 窗口、页面（static/）和页面调用的接口
 evals/tasks/ 评测题目：每题一个目录，task.toml + repo/
 tests/       单元测试和沙盒测试
