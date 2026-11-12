@@ -212,6 +212,10 @@ textarea.input { resize: vertical; line-height: 1.5; }
 
 .input-row { display: flex; gap: 6px; }
 
+.repeat { display: flex; align-items: center; gap: 6px; color: var(--ink-2); white-space: nowrap; }
+.repeat select { width: auto; padding: 0 6px; }
+.eval-options { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 12.5px; }
+
 .check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .check input { margin: 0; accent-color: var(--accent); }
 

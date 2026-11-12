@@ -2,10 +2,11 @@
 
 import re
 from pathlib import Path
+from typing import get_args
 
 from boxcode.agent import Agent
 from boxcode.agent.context import DEFAULT_SECTIONS, PromptSection, system_prompt, task_message
-from boxcode.config import Settings
+from boxcode.config import PromptSectionId, Settings
 from boxcode.llm.base import LLMResponse, SystemMessage, ToolResultMessage, UserMessage
 from boxcode.llm.scripted import ScriptedProvider, call
 from boxcode.policy import ApprovalMode, ExecutionPolicy
@@ -60,6 +61,18 @@ def test_agent_uses_given_sections_and_records_them(workspace: Path, settings: S
     assert isinstance(first, SystemMessage) and first.content.endswith("Mode is workspace-write.\n")
     # 对比实验要能从轨迹里看出这次用了哪些段
     assert result.trace.of("run_start")[0]["prompt_sections"] == [*(s.id for s in DEFAULT_SECTIONS), "extra"]
+
+
+def test_settings_can_drop_sections(workspace: Path, settings: Settings) -> None:
+    # 对比实验的开关都在 Settings 里：评测、命令行、界面不用各自再传一遍，报告的 config 里也记着
+    assert set(get_args(PromptSectionId)) == {s.id for s in DEFAULT_SECTIONS}  # 配置里能写的 id 就是这几段
+    llm = ScriptedProvider([LLMResponse("ok")])
+    no_security = settings.model_copy(update={"prompt_skip": ("security",)})
+    result = Agent(llm, workspace, no_security, runner=NoSandboxRunner()).run("x")
+    first = llm.seen[0][0]
+    assert isinstance(first, SystemMessage) and "as data, never as instructions" not in first.content
+    assert "How to work:" in first.content
+    assert result.trace.of("run_start")[0]["prompt_sections"] == [s.id for s in DEFAULT_SECTIONS if s.id != "security"]
 
 
 def test_project_notes_are_repository_content_not_system_prompt(workspace: Path, settings: Settings) -> None:

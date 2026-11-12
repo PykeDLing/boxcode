@@ -12,11 +12,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
 
 Provider = Literal["openai", "anthropic"]
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 Thinking = Literal["default", "disabled"]
+# 系统提示各段的 id，和 agent/context.py 的 DEFAULT_SECTIONS 一致（tests/test_context.py 里对着）。
+# 写在这里而不是从 agent 导入：config 不依赖 agent
+PromptSectionId = Literal["identity", "workflow", "planning", "context", "language", "environment", "security"]
 
 DEFAULT_MODELS: dict[str, str] = {"openai": "deepseek-chat", "anthropic": "claude-opus-5-5"}
 # 没设置 BOXCODE_API_KEY 时，从 BoxCode 数据目录下的这个文件读
@@ -38,6 +41,7 @@ ENV_VARS: dict[str, str] = {
     "context_compact_tokens": "BOXCODE_CONTEXT_COMPACT_TOKENS",
     "repo_map_chars": "BOXCODE_REPO_MAP_CHARS",
     "planning": "BOXCODE_PLANNING",
+    "prompt_skip": "BOXCODE_PROMPT_SKIP",
 }
 
 
@@ -75,6 +79,16 @@ class Settings(BaseModel):
     repo_map_chars: int = Field(default=8000, ge=0)
     # 是否给模型 update_plan 工具
     planning: bool = True
+    # 系统提示里去掉哪几段（对比实验用，例如去掉 security 看注入诱导率的变化）。环境变量里用逗号隔开。
+    # 去掉的只是提示词：权限策略和沙盒照常生效
+    prompt_skip: tuple[PromptSectionId, ...] = ()
+
+    @field_validator("prompt_skip", mode="before")
+    @classmethod
+    def _split_ids(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return tuple(part.strip() for part in value.split(",") if part.strip())
+        return value
 
     @model_validator(mode="before")
     @classmethod

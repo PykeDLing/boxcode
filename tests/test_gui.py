@@ -15,7 +15,7 @@ from boxcode.gui.api import EXPOSED, GuiApi, bridge_functions
 from boxcode.gui.app import TEXT_SUBSTITUTIONS, disable_text_substitutions, page_html
 from boxcode.llm.base import LLMProvider, LLMResponse, LLMUnavailable
 from boxcode.llm.scripted import ScriptedProvider, call
-from boxcode.trace import TraceRecorder, read_trace
+from boxcode.trace import TRACE_VERSION, TraceRecorder, read_trace
 from tests.conftest import macos_only
 
 TASKS = Path(__file__).parent.parent / "evals" / "tasks"
@@ -56,6 +56,11 @@ def test_page_html_inlines_assets_with_fresh_nonce() -> None:
     assert len(nonces) == 1  # CSP 和脚本标签用的是同一个
     assert "default-src 'none'" in html and "window.boxcode" in html and "--accent" in html
     assert nonces.isdisjoint(re.findall(r"nonce-([\w-]+)'", page_html()))  # 每次打开窗口都换
+
+
+def test_page_knows_the_trace_version() -> None:
+    # 轨迹格式变了（TRACE_VERSION 加一）时界面要跟着改：两边的数对不上，这里先报出来
+    assert f"const TRACE_VERSION = {TRACE_VERSION};" in page_html()
 
 
 def test_text_fields_not_autocorrected() -> None:
@@ -276,6 +281,8 @@ def test_eval_reports_progress(settings: Settings, tmp_path: Path) -> None:
     assert page.finished.wait(WAIT_S)
 
     assert [d["state"] for d in page.of("eval_progress")] == ["running", "done"]
+    # 推给页面的结果里带着失败归因的字段（这一题通过了，所以是空的）
+    assert page.of("eval_progress")[1]["result"]["failure"] is None
     finished = page.of("eval_finished")[0]
     assert finished["report_id"] == res["report_id"] and not finished["stopped"]
     assert finished["report"]["pass_rate"] == 1.0
@@ -284,6 +291,29 @@ def test_eval_reports_progress(settings: Settings, tmp_path: Path) -> None:
     assert api.list_reports()[0]["id"] == res["report_id"]
     events = api.load_eval_trace(res["report_id"], "001-fix-moving-average")
     assert events[0]["event"] == "run_start" and events[-1]["event"] == "run_end"
+
+
+@macos_only
+def test_eval_repeats_each_task(settings: Settings, tmp_path: Path) -> None:
+    task = "001-fix-moving-average"
+    page = Page()
+    api = make_api(settings, tmp_path, page, [LLMResponse("done")])
+    for bad in (0, 21, True, "3", 1.5):  # 页面传来的是 JSON，什么都可能有
+        assert "1 到 20" in api.start_eval([task], bad)["error"]  # type: ignore[arg-type]
+        assert "1 到 8" in api.start_eval([task], 2, bad)["error"]  # type: ignore[arg-type]
+    assert not (tmp_path / "results").exists()  # 参数不对就不开始
+
+    res = api.start_eval([task], 2, 2)  # 每题 2 次，两次同时跑
+    assert res["task_ids"] == [task] and res["run_ids"] == [task, f"{task}#2"]
+    assert page.finished.wait(WAIT_S)
+    # 进度按每一次运行推（页面上一行是一次）；同时跑的时候两次的消息会穿插
+    progress = page.of("eval_progress")
+    for run_id in res["run_ids"]:
+        assert [d["state"] for d in progress if d["task_id"] == run_id] == ["running", "done"]
+    rep = page.of("eval_finished")[0]["report"]
+    assert [r["id"] for r in rep["results"]] == res["run_ids"] and rep["jobs"] == 2
+    assert (rep["tasks"], rep["runs"]) == (1, 2) and rep["per_task"][0]["failures"] == {"no_edit": 2}
+    assert api.load_eval_trace(res["report_id"], f"{task}#2")[0]["event"] == "run_start"
 
 
 def test_bridge_requires_token_and_hides_internals(settings: Settings, tmp_path: Path) -> None:

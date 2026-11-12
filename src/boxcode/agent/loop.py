@@ -43,7 +43,7 @@ from boxcode.sandbox import SandboxRunner
 from boxcode.tools import Tool, ToolContext, ToolError, ToolResult, default_tools
 from boxcode.tools.base import truncate
 from boxcode.tools.plan import PLAN_TOOL
-from boxcode.trace import TraceRecorder
+from boxcode.trace import TRACE_VERSION, TraceRecorder
 
 # 权限策略说“要问”时调用：返回 True 放行。评测时用 deny_all（一律不放行）
 Approver = Callable[[Tool[Any], BaseModel, Decision], bool]
@@ -102,7 +102,8 @@ class Agent:
         runner: SandboxRunner | None = None,  # 默认按 execution 生成；测试里换成 NoSandboxRunner
         cancel: threading.Event | None = None,
         hooks: Sequence[ToolHook] = (),
-        prompt_sections: Sequence[PromptSection] = DEFAULT_SECTIONS,
+        # 不传就是 DEFAULT_SECTIONS 去掉 settings.prompt_skip 里的几段
+        prompt_sections: Sequence[PromptSection] | None = None,
     ) -> None:
         self.llm = llm
         self.workspace = canonical(workspace)  # 解析链接、换成磁盘上真实的大小写
@@ -118,6 +119,8 @@ class Agent:
                                self.cancel, self._record)
         self.trace = trace or TraceRecorder(settings.runs_dir)
         self.hooks = ToolHooks(hooks, self.trace)
+        if prompt_sections is None:
+            prompt_sections = [s for s in DEFAULT_SECTIONS if s.id not in settings.prompt_skip]
         self.prompt_sections = tuple(prompt_sections)
         # 服务器负责清理时，客户端不能再改发出去的历史（Claude 的思考块签名绑定了它前面的全部内容）
         self._compactor = ContextCompactor(0 if clears_tool_results(llm) else settings.context_compact_tokens)
@@ -128,8 +131,9 @@ class Agent:
             raise RuntimeError("一个 Agent 只能运行一次，再跑一次请新建一个")
         state = self._state = _State()
         try:
-            self.trace.emit("run_start", task=task, model=self.llm.name, mode=self.execution.mode.value,
-                            allow_network=self.execution.allow_network, sandbox=self.ctx.runner.name,
+            self.trace.emit("run_start", trace_version=TRACE_VERSION, task=task, model=self.llm.name,
+                            mode=self.execution.mode.value, allow_network=self.execution.allow_network,
+                            sandbox=self.ctx.runner.name,
                             workspace=str(self.workspace), verify=verify_command,
                             prompt_sections=[s.id for s in self.prompt_sections],
                             context_compact_tokens=self.settings.context_compact_tokens,

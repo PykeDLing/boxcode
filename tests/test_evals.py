@@ -5,13 +5,25 @@ import subprocess
 import threading
 import uuid
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from boxcode import __version__
 from boxcode.config import Settings
-from boxcode.evals import Task, TaskResult, load_tasks, report, run_meta, run_task, save_report
+from boxcode.evals import (
+    Task,
+    TaskResult,
+    load_tasks,
+    new_run_dir,
+    report,
+    result_id,
+    run_eval,
+    run_meta,
+    run_task,
+    save_report,
+)
 from boxcode.evals.runner import (
     UNKNOWN_VERSION,
     CodeVersion,
@@ -22,8 +34,9 @@ from boxcode.evals.runner import (
     parse_git_output,
     prepare_workspace,
 )
-from boxcode.llm.base import LLMResponse, Message, ToolCall, ToolSpec
+from boxcode.llm.base import LLMResponse, LLMUnavailable, Message, ToolCall, ToolSpec
 from boxcode.llm.scripted import ScriptedProvider, call
+from boxcode.trace import read_trace
 from tests.conftest import macos_only
 
 TASKS = Path(__file__).parent.parent / "evals" / "tasks"
@@ -84,6 +97,7 @@ def test_scripted_fix_passes(settings: Settings, tmp_path: Path) -> None:
     result = run_task(task, lambda: scripted(FIX), settings, tmp_path / "out")
     assert result.passed and result.check_passed and not result.induced, result.check_detail
     assert "全部通过" in result.check_detail
+    assert result.failure is None and result.changed_files == ["stats.py"] and result.failed_tests == []
     assert (task.repo / "stats.py").read_text().count("window + 1") == 0  # 原题没被改
     assert not list((tmp_path / "out").glob("check-*"))  # 判分目录用完就删
 
@@ -219,8 +233,22 @@ def test_report_merges_repeated_runs() -> None:
     rep = report([_result("a", True), _result("b", True), _result("a#2", False, induced=True)])
     assert rep["tasks"] == 2 and rep["runs"] == 3 and rep["pass_rate"] == pytest.approx(0.667, abs=1e-3)
     assert rep["per_task"][0] == {"id": "a", "category": "injection", "runs": 2, "passed": 1, "induced": 1,
-                                  "avg_llm_calls": 3.0, "avg_tokens": 12}
+                                  "failures": {}, "avg_llm_calls": 3.0, "avg_tokens": 12}
     assert [r["id"] for r in rep["results"]] == ["a", "b", "a#2"]  # 每一行对得上自己的轨迹
+
+
+def test_report_counts_failures_by_cause() -> None:
+    failed = [replace(_result("a", False), failure="hidden_tests"), replace(_result("a#2", False), failure="no_edit"),
+              replace(_result("b", False), failure="hidden_tests"),
+              replace(_result("c", False), failure="llm_error", agent_status="error"),
+              # 接口出错之前已经改对了：判分通过，但这次运行还是没跑完
+              replace(_result("d", True), agent_status="error")]
+    rep = report([*failed, _result("e", True)])
+    assert rep["failures"] == {"hidden_tests": 2, "no_edit": 1, "llm_error": 1}
+    assert next(iter(rep["failures"])) == "hidden_tests"  # 多的在前
+    assert rep["interrupted_runs"] == 2 and rep["pass_rate"] == pytest.approx(0.333, abs=1e-3)
+    assert rep["per_task"][0]["failures"] == {"hidden_tests": 1, "no_edit": 1}
+    assert report([_result("e", True)])["failures"] == {}
 
 
 def test_report_records_config_and_code_version(tmp_path: Path) -> None:
@@ -448,6 +476,7 @@ def test_agent_crash_is_recorded_not_raised(settings: Settings, tmp_path: Path) 
     # 一题出错不该让整轮评测停下，前面题目的结果也不能丢
     result = run_task(task_001(), Crashing, settings, tmp_path / "out")
     assert result.agent_status == "crashed" and not result.passed
+    assert result.failure == "crashed" and "bug in agent" in result.failure_detail
     assert result.trace_path and "RuntimeError" in Path(result.trace_path).read_text()
 
 
@@ -459,7 +488,7 @@ def test_injection_counted_even_when_blocked(settings: Settings, tmp_path: Path,
     fooled = ToolCall("c1", "run_command", '{"command": "' + command + '"}')
     result = run_task(task, lambda: ScriptedProvider([LLMResponse(None, [fooled]), LLMResponse("done")]),
                       settings, tmp_path / "out")
-    assert result.induced and not result.passed
+    assert result.induced and not result.passed and result.failure == "induced"
     assert report([result])["injection_induced_rate"] == 1.0
 
 
@@ -650,3 +679,168 @@ def test_tests_cannot_be_editable(tmp_path: Path, editable: str) -> None:
     # editable 里的模块在被测进程里执行：测试和 conftest 要是也能改，就等于能改判分
     with pytest.raises(ValueError, match="测试文件"):
         make_task(tmp_path, {"mod.py": "", "tests/test_mod.py": ""}, editable=editable)
+
+
+# ---- 失败归因：接进评测之后，没通过的运行各归到什么原因上（规则本身在 test_attribution.py 里测） ----
+
+WRONG_FIX = call("edit_file", path="stats.py", old_string="range(len(values) - window)",
+                 new_string="range(len(values) - window + 2)")
+
+
+class Unavailable:
+    name = "unavailable"
+
+    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: object = None) -> LLMResponse:
+        raise LLMUnavailable("Claude 接口错误 529：overloaded")
+
+
+@macos_only
+@pytest.mark.parametrize(("calls", "status", "failure", "detail"), [
+    ([], "verify_failed", "no_edit", "一模一样"),
+    # 把测试改成一定通过：自检过了，判分用的是原题的测试
+    ([call("write_file", path="tests/test_stats.py", content="def test_ok():\n    pass\n")], "done", "wrong_files",
+     "tests/test_stats.py"),
+    ([call("run_command", command="pip install numpy")], "verify_failed", "blocked", "pip install numpy"),
+    ([WRONG_FIX], "verify_failed", "verify_failed", "2 轮"),
+], ids=lambda v: v if isinstance(v, str) and v.isascii() and " " not in v else "")
+def test_failed_run_gets_a_cause(settings: Settings, tmp_path: Path, calls: list[ToolCall], status: str,
+                                 failure: str, detail: str) -> None:
+    result = run_task(task_001(), lambda: scripted(*calls), settings, tmp_path / "out")
+    assert not result.passed and result.agent_status == status
+    assert (result.failure, detail in result.failure_detail) == (failure, True), result.failure_detail
+    assert result.failed_tests and all(t.startswith("tests/test_stats.py::") for t in result.failed_tests)
+    assert result.changed_files == (["stats.py"] if failure == "verify_failed" else [])
+
+
+@macos_only
+def test_passing_only_the_visible_tests_is_its_own_cause(settings: Settings, tmp_path: Path) -> None:
+    task = load_tasks(TASKS, only=["301-duration-spec"])[0]
+    result = run_task(task, lambda: scripted(*_overlay(task.repo.parent / "naive")), settings, tmp_path / "out")
+    assert result.agent_status == "done" and result.failure == "hidden_tests", result.failure_detail
+    assert result.changed_files == ["durations.py"]
+    assert all(t.startswith("tests/test_hidden_durations.py::") for t in result.failed_tests)
+    assert report([result])["failures"] == {"hidden_tests": 1}
+
+
+@macos_only
+@pytest.mark.parametrize(("check", "failure"), [
+    (None, "untested"), ("python -m pytest -q", "known_failing"), ("python -c 'import mod'", "wrong_fix"),
+])
+def test_without_verify_the_agents_own_checks_decide(settings: Settings, tmp_path: Path, check: str | None,
+                                                     failure: str) -> None:
+    task = make_task(tmp_path, {"mod.py": "def value():\n    return 1\n",
+                                "tests/test_mod.py": "import mod\n\ndef test_value():\n    assert mod.value() == 2\n"})
+    calls = [call("write_file", path="mod.py", content="def value():\n    return 3\n"),
+             *([call("run_command", command=check)] if check else [])]
+    result = run_task(task, lambda: scripted(*calls), settings, tmp_path / "out")
+    assert result.agent_status == "done" and result.failure == failure, result.failure_detail
+
+
+@macos_only
+def test_run_out_of_turns_and_interface_errors_are_told_apart(settings: Settings, tmp_path: Path) -> None:
+    one_turn = settings.model_copy(update={"max_turns": 1})
+    result = run_task(task_001(), lambda: scripted(WRONG_FIX), one_turn, tmp_path / "out")
+    assert result.failure == "max_turns" and "最后一轮还在改文件" in result.failure_detail
+    broken = run_task(task_001(), Unavailable, settings, tmp_path / "out")
+    assert broken.agent_status == "error" and broken.failure == "llm_error" and "529" in broken.failure_detail
+    assert report([result, broken])["interrupted_runs"] == 1
+
+
+def test_run_eval_is_the_one_loop(settings: Settings, tmp_path: Path) -> None:
+    # 命令行和界面都走 run_eval：一轮一轮地跑，每做完一次就写报告，停下之后不再开始新的
+    tasks = load_tasks(TASKS, only=["001-fix-moving-average", "002-implement-slugify"])
+    first, second = (t.id for t in tasks)
+    run_dir = tmp_path / "out"
+    cancel = threading.Event()
+    started: list[str] = []
+    in_report: list[int] = []
+
+    def on_start(task: Task, attempt: int) -> None:
+        started.append(result_id(task.id, attempt))
+
+    def on_result(result: TaskResult) -> None:
+        saved = json.loads((run_dir / "report.json").read_text())
+        assert saved["results"][-1]["id"] == result.id  # 调用时这一次已经写进报告
+        in_report.append(saved["runs"])
+        if len(in_report) == 3:
+            cancel.set()
+
+    no_security = settings.model_copy(update={"prompt_skip": ("security",)})
+    rep = run_eval(tasks, lambda: ScriptedProvider([LLMResponse("done")]), no_security, run_dir, repeat=2,
+                   meta=run_meta(no_security, UNKNOWN_VERSION), no_sandbox=True, cancel=cancel,
+                   on_start=on_start, on_result=on_result)
+    assert started == [first, second, f"{first}#2"]  # 第二道题的第 2 次没有开始
+    assert in_report == [1, 2, 3]
+    assert [r["id"] for r in rep["results"]] == started and (rep["tasks"], rep["runs"]) == (2, 3)
+    assert json.loads((run_dir / "report.json").read_text()) == rep and rep["jobs"] == 1
+    # 对比实验的开关从 Settings 一路传到 Agent，报告里也记着
+    assert rep["config"]["prompt_skip"] == ["security"]
+    assert "security" not in read_trace(Path(rep["results"][0]["trace_path"]))[0]["prompt_sections"]
+
+    cancel.set()  # 一开始就停了：一次都不跑，报告是空的
+    empty = run_eval(tasks, lambda: ScriptedProvider([]), settings, tmp_path / "empty", cancel=cancel,
+                     meta=run_meta(settings, UNKNOWN_VERSION))
+    assert empty["runs"] == 0 and (tmp_path / "empty" / "report.json").is_file()
+
+
+def test_each_round_gets_its_own_directory(tmp_path: Path) -> None:
+    # 同一秒里开了两轮评测（界面上连点、两个终端），结果不能写进同一个目录
+    first, second = new_run_dir(tmp_path / "results"), new_run_dir(tmp_path / "results")
+    assert first != second and first.is_dir() and second.is_dir() and first.parent == tmp_path / "results"
+
+
+class Together:
+    """每次运行第一次问模型时，等另一次运行也到了这一步才往下走：一次一次先后跑的话，这里等不到另一个。"""
+
+    name = "together"
+
+    def __init__(self, barrier: threading.Barrier) -> None:
+        self.barrier = barrier
+        self.waited = False
+
+    def complete(self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: object = None) -> LLMResponse:
+        if not self.waited:
+            self.waited = True
+            self.barrier.wait(timeout=30)
+        return LLMResponse("done")
+
+
+def test_runs_can_overlap_and_the_report_keeps_the_planned_order(settings: Settings, tmp_path: Path) -> None:
+    tasks = load_tasks(TASKS, only=["001-fix-moving-average", "002-implement-slugify"])
+    barrier = threading.Barrier(2)
+    active = 0
+    seen: list[str] = []
+
+    def on_start(task: Task, attempt: int) -> None:
+        nonlocal active
+        active += 1
+        assert active == 1  # 两个回调不会同时被调用：命令行和界面在里面不用自己加锁
+        seen.append(f"start {task.id}")
+        active -= 1
+
+    def on_result(result: TaskResult) -> None:
+        nonlocal active
+        active += 1
+        assert active == 1
+        seen.append(f"done {result.id}")
+        active -= 1
+
+    rep = run_eval(tasks, lambda: Together(barrier), settings, tmp_path / "out", jobs=2, no_sandbox=True,
+                   meta=run_meta(settings, UNKNOWN_VERSION), on_start=on_start, on_result=on_result)
+    # 两次运行真的是同时在跑：都等到了对方（等不到的话 barrier 超时，那次运行会以 crashed 结束）
+    assert [r["agent_status"] for r in rep["results"]] == ["verify_failed", "verify_failed"]
+    assert [r["id"] for r in rep["results"]] == [t.id for t in tasks]  # 按排的顺序，不看谁先做完
+    assert sorted(seen) == sorted(f"{what} {t.id}" for what in ("start", "done") for t in tasks)
+    assert rep["jobs"] == 2 and json.loads((tmp_path / "out" / "report.json").read_text()) == rep
+
+
+def test_an_error_in_one_parallel_run_stops_the_rest(settings: Settings, tmp_path: Path) -> None:
+    # 评测框架自己出错（这里是建不出模型）：不能悄悄少跑几次，异常要抛出来，别的运行跟着停下
+    def no_model() -> ScriptedProvider:
+        raise RuntimeError("no model")
+
+    cancel = threading.Event()
+    with pytest.raises(RuntimeError, match="no model"):
+        run_eval([task_001()], no_model, settings, tmp_path / "out", repeat=4, jobs=2, no_sandbox=True, cancel=cancel,
+                 meta=run_meta(settings, UNKNOWN_VERSION))
+    assert cancel.is_set()

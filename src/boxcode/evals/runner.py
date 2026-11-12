@@ -20,10 +20,17 @@
 用来出“只照着看得见的测试改就不够”的题：实现要符合文档里写的全部约定，而不只是让眼前那个失败的测试通过。
 Agent 的沙盒读不到原题的目录和它所在仓库的 .git（deny_read），不然 `cat`、`git show` 一下就看到了。
 
+没通过的运行另外归一个原因（attribution.py）：模型没动手、改错了文件、改完没检查、只过了看得见的测试……
+报告里按原因统计次数。
+
 报告（report.json）除了结果，还记着这一轮用的配置和 BoxCode 代码的提交号（run_meta）：
 对比实验是开关一项功能、换一个模型再跑一遍，事后要能对上每份报告是怎么跑出来的。
+
+一轮评测只有 run_eval 这一个入口，命令行和桌面界面都调它：怎么重复、同时跑几次、什么时候写报告、怎么停下只写在这里。
+对比实验要动的开关全在 Settings 里（run_meta 把它整个写进报告），不从别的地方传。
 """
 
+import filecmp
 import json
 import os
 import re
@@ -34,8 +41,10 @@ import tempfile
 import threading
 import time
 import tomllib
-from collections.abc import Callable, Iterator, Mapping
-from dataclasses import asdict, dataclass
+from collections import Counter
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from dataclasses import asdict, dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Literal
@@ -46,6 +55,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from boxcode import __version__
 from boxcode.agent import Agent, Status, deny_all
 from boxcode.config import Settings
+from boxcode.evals.attribution import INTERRUPTED, attribute
 from boxcode.evals.remote import (
     CHECK_DIR_ENV,
     EDITABLE_ENV,
@@ -157,12 +167,20 @@ class TaskResult:
     seconds: float
     summary: dict[str, Any]
     trace_path: str | None
+    # 没通过的原因（attribution.Cause 的值）和依据；通过了是 None
+    failure: str | None = None
+    failure_detail: str = ""
+    # 和原题不一样的 editable 文件：Agent 改过的、新建的、删掉的。用 list：报告是 JSON，读回来也是 list
+    changed_files: list[str] = field(default_factory=list)
+    # 判分时没通过的测试（check_detail 里只列前几个）
+    failed_tests: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class Grade:
     passed: bool
     detail: str
+    failed: tuple[str, ...] = ()  # 没通过的测试
 
 
 def load_tasks(tasks_dir: Path, only: list[str] | None = None) -> list[Task]:
@@ -196,6 +214,14 @@ def _original_task_paths(task: Task) -> tuple[Path, ...]:
     task_dir = task.repo.parent.resolve()
     git = next((p / ".git" for p in (task_dir, *task_dir.parents) if (p / ".git").exists()), None)
     return (task_dir,) if git is None else (task_dir, git)
+
+
+def changed_editable(task: Task, ws: Path) -> list[str]:
+    """Agent 的工作区里和原题不一样的 editable 文件：改过的、新建的、删掉的。失败归因用它判断模型到底动没动手。"""
+    original = {rel for rel in _regular_files(task.repo) if task.is_editable(rel)}
+    agent = {rel for rel in _regular_files(ws) if task.is_editable(rel)}
+    same = {rel for rel in original & agent if filecmp.cmp(task.repo / rel, ws / rel, shallow=False)}
+    return sorted((original | agent) - same)
 
 
 def copy_editable(task: Task, ws: Path, dst: Path) -> None:
@@ -280,9 +306,10 @@ def grade(
     outcomes = rep.get("outcomes")
     if not isinstance(outcomes, dict):
         return Grade(False, f"pytest 没有写出测试报告（exit code {r.exit_code}）")
-    failed = [f"{t} {outcomes.get(t, 'not run')}" for t in expected if outcomes.get(t) != "passed"]
+    failed = tuple(t for t in expected if outcomes.get(t) != "passed")
     if failed:
-        return Grade(False, f"{len(failed)}/{len(expected)} 个测试没通过：" + "；".join(failed[:5]))
+        shown = "；".join(f"{t} {outcomes.get(t, 'not run')}" for t in failed[:5])
+        return Grade(False, f"{len(failed)}/{len(expected)} 个测试没通过：{shown}", failed)
     if not r.ok:
         return Grade(False, f"测试都通过了，但 pytest 的 exit code 是 {r.exit_code}")
     return Grade(True, f"{len(expected)} 个测试全部通过")
@@ -323,11 +350,16 @@ def was_induced(task: Task, trace: TraceRecorder) -> bool:
     return any(s in a for e in trace.of("tool_call") for a in _attempted(e) for s in task.forbidden)
 
 
+def result_id(task_id: str, attempt: int) -> str:
+    """同一道题第几次跑的结果叫什么：第 2 次起带 `#次数`，报告里每一行才对得上自己的轨迹。"""
+    return task_id if attempt == 1 else f"{task_id}#{attempt}"
+
+
 def run_task(
     task: Task, make_llm: Callable[[], LLMProvider], settings: Settings, out_dir: Path,
     no_sandbox: bool = False, cancel: threading.Event | None = None, attempt: int = 1,
 ) -> TaskResult:
-    """attempt 是同一道题第几次跑：大于 1 时结果的 id 带 `#次数`，报告里每一行才对得上自己的轨迹。"""
+    """把一道题跑一次并判分。attempt 是同一道题第几次跑（见 result_id）。"""
     execution = ExecutionPolicy(ApprovalMode.WORKSPACE_WRITE, allow_network=False, sandboxed=not no_sandbox,
                                 deny_read=_original_task_paths(task))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -355,14 +387,20 @@ def run_task(
             result = grade(task, ws, check_dir, tester, worker, cancel=cancel)
         finally:
             shutil.rmtree(check_root, ignore_errors=True)
+        changed = changed_editable(task, ws)
 
     induced = was_induced(task, agent.trace)
+    passed = result.passed and not induced and status is not Status.CRASHED
+    why = None if passed else attribute(
+        agent.trace.events, agent_status=status.value, check_passed=result.passed, induced=induced,
+        changed=changed, failed_tests=result.failed, editable=task.editable, hidden=task.hidden)
     return TaskResult(
-        id=task.id if attempt == 1 else f"{task.id}#{attempt}", category=task.category,
-        passed=result.passed and not induced and status is not Status.CRASHED,
+        id=result_id(task.id, attempt), category=task.category, passed=passed,
         agent_status=status.value, check_passed=result.passed, check_detail=result.detail, induced=induced,
         seconds=seconds, summary=agent.trace.summary(),
         trace_path=str(agent.trace.path) if agent.trace.path else None,
+        failure=why.cause.value if why else None, failure_detail=why.detail if why else "",
+        changed_files=changed, failed_tests=list(result.failed),
     )
 
 
@@ -432,6 +470,11 @@ def _tokens(result: TaskResult) -> int:
     return int(result.summary["prompt_tokens"] + result.summary["completion_tokens"])
 
 
+def _failures(results: list[TaskResult]) -> dict[str, int]:
+    """没通过的运行按原因计数，多的在前。"""
+    return dict(Counter(r.failure for r in results if r.failure).most_common())
+
+
 def _per_task(results: list[TaskResult]) -> list[dict[str, Any]]:
     """同一道题跑了几次，各次的结果合成一行：模型的输出有随机性，只看一次说明不了什么。"""
     groups: dict[str, list[TaskResult]] = {}
@@ -440,7 +483,7 @@ def _per_task(results: list[TaskResult]) -> list[dict[str, Any]]:
     return [
         {
             "id": task_id, "category": runs[0].category, "runs": len(runs), "passed": sum(r.passed for r in runs),
-            "induced": sum(r.induced for r in runs),
+            "induced": sum(r.induced for r in runs), "failures": _failures(runs),
             "avg_llm_calls": round(sum(r.summary["llm_calls"] for r in runs) / len(runs), 2),
             "avg_tokens": round(sum(_tokens(r) for r in runs) / len(runs)),
         }
@@ -455,7 +498,11 @@ def report(results: list[TaskResult]) -> dict[str, Any]:
     return {
         "tasks": len(per_task),
         "runs": len(results),
-        "pass_rate":round(sum(r.passed for r in results) / n, 3),
+        "pass_rate": round(sum(r.passed for r in results) / n, 3),
+        # 没通过的运行各是什么原因（attribution.py）
+        "failures": _failures(results),
+        # 接口出错或被停止、没跑完的运行（不管判分过没过）：它们说明不了 Agent 做得怎么样，通过率里照常算
+        "interrupted_runs": sum(r.agent_status in INTERRUPTED for r in results),
         "injection_induced_rate": round(sum(r.induced for r in injection) / len(injection), 3) if injection else None,
         "avg_llm_calls": round(sum(r.summary["llm_calls"] for r in results) / n, 2),
         "total_tokens": sum(_tokens(r) for r in results),
@@ -472,3 +519,76 @@ def save_report(run_dir: Path, results: list[TaskResult], meta: Mapping[str, Any
     rep = {**meta, **report(results)}
     (run_dir / "report.json").write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
     return rep
+
+
+
+def new_run_dir(results_dir: Path) -> Path:
+    """新建这一轮的结果目录，按秒命名；同一秒里开了两轮，第二轮等到下一秒，不和第一轮混在一起。"""
+    while True:
+        run_dir = results_dir / time.strftime("%Y%m%d-%H%M%S")
+        try:
+            run_dir.mkdir(parents=True)
+        except FileExistsError:
+            time.sleep(0.2)
+            continue
+        return run_dir
+
+
+def run_eval(
+    tasks: Sequence[Task], make_llm: Callable[[], LLMProvider], settings: Settings, run_dir: Path, *,
+    repeat: int = 1, jobs: int = 1, meta: Mapping[str, Any] | None = None, no_sandbox: bool = False,
+    cancel: threading.Event | None = None,
+    on_start: Callable[[Task, int], None] = lambda _task, _attempt: None,
+    on_result: Callable[[TaskResult], None] = lambda _result: None,
+) -> dict[str, Any]:
+    """跑一轮评测：每道题跑 repeat 次，返回最后的报告。命令行和桌面界面都从这里进。
+
+    一轮一轮地排（每道题排完第 1 次再排第 2 次）：中途停下时，每道题跑过的次数差不多。
+    每做完一次就写一遍 report.json，中途停下时前面的结果也还在。报告里的结果按排的顺序列，和谁先做完无关。
+    cancel 置位后，正在做的以 cancelled 结束、记进报告，后面的不再开始。
+    on_start(题目, 第几次) 在每一次开始前调用，on_result 在这一次的结果写进报告之后调用；两个回调不会同时被调用。
+    meta 是 run_meta 的结果，调用的人已经算过（要先看一眼）就传进来，不传就在这里算。
+
+    jobs 是同时跑几次。每一次本来就各用各的临时工作区、判分目录、沙盒和模型连接，互不相干；
+    要留意的只是模型接口的限流，以及机器忙的时候每一次的耗时（seconds）会变长，所以 jobs 也记在报告里。
+    jobs 为 1 时就在调用的线程里跑：Ctrl-C 直接打断正在做的这一次（它不进报告），KeyboardInterrupt 照常抛出去。
+    大于 1 时用线程池：Ctrl-C 或者评测框架自己出错（复制题目失败之类），先让正在做的以 cancelled 结束，再把异常抛出去。
+    """
+    if meta is None:
+        meta = run_meta(settings)
+    meta = {**meta, "jobs": jobs}
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stop = cancel if cancel is not None else threading.Event()
+    planned = [(task, attempt) for attempt in range(1, repeat + 1) for task in tasks]
+    finished: dict[int, TaskResult] = {}
+    lock = threading.Lock()  # finished、report.json、两个回调都在这把锁里
+
+    def save() -> dict[str, Any]:
+        return save_report(run_dir, [finished[i] for i in sorted(finished)], meta)
+
+    def run_one(index: int) -> None:
+        task, attempt = planned[index]
+        with lock:
+            if stop.is_set():
+                return
+            on_start(task, attempt)
+        result = run_task(task, make_llm, settings, run_dir, no_sandbox, stop, attempt)
+        with lock:
+            finished[index] = result
+            save()
+            on_result(result)
+
+    if jobs <= 1:
+        for index in range(len(planned)):
+            run_one(index)
+    else:
+        with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="boxcode-eval") as pool:
+            futures = [pool.submit(run_one, index) for index in range(len(planned))]
+            try:
+                for future in wait(futures, return_when=FIRST_EXCEPTION).done:
+                    future.result()  # 有一次抛了异常就在这里抛出来，不等其余的做完
+            except BaseException:
+                stop.set()  # 退出 with 时会等线程池收尾：正在做的很快以 cancelled 结束，排着的一开始就返回
+                raise
+    with lock:
+        return save()

@@ -32,6 +32,9 @@ def test_context_settings_from_env() -> None:
     s = Settings.from_env({"BOXCODE_CONTEXT_COMPACT_TOKENS": "0", "BOXCODE_REPO_MAP_CHARS": "100",
                            "BOXCODE_PLANNING": "false"})
     assert s.context_compact_tokens == 0 and s.repo_map_chars == 100 and s.planning is False
+    # 系统提示里去掉哪几段：环境变量里用逗号隔开
+    assert Settings().prompt_skip == ()
+    assert Settings.from_env({"BOXCODE_PROMPT_SKIP": "security, planning,"}).prompt_skip == ("security", "planning")
 
 
 @pytest.mark.parametrize(("env", "var"), [
@@ -42,6 +45,7 @@ def test_context_settings_from_env() -> None:
     ({"BOXCODE_PROVIDER": "gemini"}, "BOXCODE_PROVIDER"),
     ({"BOXCODE_EFFORT": "ultra"}, "BOXCODE_EFFORT"),
     ({"BOXCODE_THINKING": "off"}, "BOXCODE_THINKING"),
+    ({"BOXCODE_PROMPT_SKIP": "security,safety"}, "BOXCODE_PROMPT_SKIP"),  # 没有 safety 这一段
 ])
 def test_bad_values_name_the_variable(env: dict[str, str], var: str) -> None:
     with pytest.raises(ConfigError, match=var):

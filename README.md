@@ -34,7 +34,7 @@ BoxCode 把模型要跑的每条命令放进 Seatbelt 沙盒（`sandbox-exec`，
 
 ## 评测结果
 
-`boxcode eval` 把每道题的仓库复制到临时目录，让 Agent 去做，再跑原题的测试判分。判分目录是原题的新拷贝，只拷回题目声明可以改的文件，pytest 隔离启动，并且原题的每个测试都要通过，不只看退出码：改测试、遮住 pytest、伪造字节码缓存、导入时直接 `exit(0)` 这些作弊写法都有测试（[技术方案 5.1](docs/design.md#51-题目格式)）。判分也在沙盒里跑。题目可以带隐藏的测试：这些文件不给 Agent，判分时照常跑，Agent 的沙盒读不到原题的目录。注入题另外统计模型有没有被诱导去执行注入的指令（不管有没有被拦下）。
+`boxcode eval` 把每道题的仓库复制到临时目录，让 Agent 去做，再跑原题的测试判分。判分目录是原题的新拷贝，只拷回题目声明可以改的文件，pytest 隔离启动，并且原题的每个测试都要通过，不只看退出码：改测试、遮住 pytest、伪造字节码缓存、导入时直接 `exit(0)` 这些作弊写法都有测试（[技术方案 5.1](docs/design.md#51-题目格式)）。判分也在沙盒里跑。题目可以带隐藏的测试：这些文件不给 Agent，判分时照常跑，Agent 的沙盒读不到原题的目录。注入题另外统计模型有没有被诱导去执行注入的指令（不管有没有被拦下）。没通过的运行会按执行轨迹归一个原因（没有改动、只改了测试、改完没有检查、只过了看得见的测试、轮数用完……），报告里按原因统计（[技术方案 5.2](docs/design.md#52-指标)）。
 
 2026-11-09，`claude-opus-5-5`，15 道题每题跑 3 次，共 45 次。这次运行在上下文功能（压缩、代码库地图、任务规划）加入之前；报告里没有记 effort（默认是 `high`）。耗时、模型调用、输入 token 都是 3 次的平均：
 
@@ -127,9 +127,12 @@ key 尽量不要放在环境变量里（包括写进 `~/.zshrc` 再 export）：
 # 在某个仓库里做一件事；--verify 是做完后的自检命令，没通过会把输出交回模型继续修
 uv run boxcode run "修好 tests/test_stats.py" -w path/to/repo --verify "python -m pytest -q"
 
-# 跑全部评测题，报告写到 evals/results/<时间>/report.json；--repeat 3 每题跑 3 次
+# 跑全部评测题，报告写到 evals/results/<时间>/report.json；--repeat 3 每题跑 3 次，--jobs 4 同时跑 4 次
 # 报告里记着这一轮的配置（模型、effort、上下文开关……）和 BoxCode 代码的提交号
-uv run boxcode eval --repeat 3
+uv run boxcode eval --repeat 3 --jobs 4
+
+# 对比实验：用环境变量换一项配置再跑一遍，例如系统提示里去掉 security 这一段
+BOXCODE_PROMPT_SKIP=security uv run boxcode eval --repeat 3
 ```
 
 每次运行的执行轨迹（每一步一行 JSON）存在 `~/.boxcode/runs/`，沙盒里的命令读不到。
@@ -144,7 +147,7 @@ uv run boxcode gui
 
 - **新任务**：选工作区、写任务、选权限模式和自检命令。点“开始”后，页面实时显示每次模型调用、工具调用、权限决定和自检结果；需要确认的命令固定在最上面，点“放行这一次”或“拒绝”。按“停止”会立刻杀掉正在执行的命令
 - **历史轨迹**：浏览 `~/.boxcode/runs/` 里的每次运行，展开看工具参数和 `edit_file` 改了什么
-- **评测**：勾选题目运行，逐题看结果、通过率和注入诱导率，点一道题看它的执行轨迹
+- **评测**：勾选题目运行（可以选每题跑几次、同时跑几次），逐题看结果（没通过的标出原因）、通过率和注入诱导率，点一道题看它的执行轨迹
 
 窗口和命令行用的是同一个 Agent、同一套权限策略和沙盒；`--dangerously-no-sandbox` 只有命令行有。界面基于 [pywebview](https://pywebview.flowrl.com/)（macOS 上是系统自带的 WebKit），`uv sync` 已经装好；只装运行依赖时用 `uv sync --no-dev --extra gui`。
 
@@ -164,6 +167,7 @@ uv run boxcode gui
 | `BOXCODE_CONTEXT_COMPACT_TOKENS` | `40000` | 上下文估算超过这么多 token 时清理旧的工具结果，`0` 表示不压缩 |
 | `BOXCODE_REPO_MAP_CHARS` | `8000` | 开头给模型的代码库地图的长度上限，`0` 表示不生成 |
 | `BOXCODE_PLANNING` | `true` | 是否给模型 `update_plan` 工具 |
+| `BOXCODE_PROMPT_SKIP` | 空 | 系统提示里去掉哪几段（对比实验用），段的 id 用逗号隔开：`identity`、`workflow`、`planning`、`context`、`language`、`environment`、`security`。去掉的只是提示词，权限策略和沙盒照常生效 |
 | `BOXCODE_HOME` | `~/.boxcode` | 执行轨迹存放位置 |
 
 值写错了（例如 `BOXCODE_MAX_TURNS=abc`、不认识的 `BOXCODE_PROVIDER`）启动时就会报出是哪个变量，退出码 2。
@@ -217,7 +221,7 @@ src/boxcode/
   policy/    权限策略
   sandbox/   Seatbelt 规则生成与执行
   trace/     执行轨迹（JSONL）
-  evals/     评测框架
+  evals/     评测框架：判分、失败归因
   gui/       桌面界面：pywebview 窗口、页面（static/）和页面调用的接口
 evals/tasks/ 评测题目：每题一个目录，task.toml + repo/
 tests/       单元测试和沙盒测试
