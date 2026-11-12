@@ -1,7 +1,6 @@
 """命令行：boxcode run "任务" / boxcode eval / boxcode gui。"""
 
 import json
-import time
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any
@@ -120,8 +119,10 @@ def eval_cmd(
     only: Annotated[list[str] | None, typer.Option(help="只跑这几道题的 id")] = None,
     out: Annotated[Path, typer.Option(help="结果目录")] = Path("evals/results"),
     repeat: Annotated[int, typer.Option(min=1, help="每道题跑几次：模型的输出有随机性，只跑一次说明不了什么")] = 1,
+    jobs: Annotated[int, typer.Option("--jobs", "-j", min=1,
+                                      help="同时跑几次：各用各的工作区和沙盒，太多会撞上模型接口的限流")] = 1,
 ) -> None:
-    from boxcode.evals import TaskResult, load_tasks, run_meta, run_task, save_report
+    from boxcode.evals import LABELS, Cause, Task, TaskResult, load_tasks, new_run_dir, result_id, run_eval, run_meta
 
     settings = load_settings()
     provider(settings)  # 先检查一次配置，没有 key 就直接退出
@@ -131,30 +132,51 @@ def eval_cmd(
         raise fail(f"读不了题目：{e}") from e
     if not tasks:
         raise fail(f"{tasks_dir} 里没有要跑的题目")
-    run_dir = out / time.strftime("%Y%m%d-%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    results: list[TaskResult] = []
+    run_dir = new_run_dir(out)
     meta = run_meta(settings)  # 配置和提交号，写进报告
     if meta["boxcode"]["dirty"]:
         console.print("[yellow]BoxCode 的代码有没提交的改动：报告里的提交号还原不出这次跑的代码[/]")
+    status = console.status("准备中…")
+    total = len(tasks) * repeat
+    running: list[str] = []  # 正在跑的每一次；run_eval 保证两个回调不会同时被调用
+    done = 0
+
+    def show() -> None:
+        status.update(f"{'、'.join(running)}（已完成 {done}/{total}）…")
+
+    def on_start(task: Task, attempt: int) -> None:
+        running.append(result_id(task.id, attempt))
+        show()
+
+    def on_result(r: TaskResult) -> None:
+        nonlocal done
+        done += 1
+        running.remove(r.id)
+        show()
+        console.print(f"{'✅' if r.passed else '❌'} {r.id}  {r.agent_status}  {r.seconds}s  {r.check_detail}",
+                      markup=False)
+        if r.failure:  # 没通过的原因和依据（失败归因）
+            console.print(f"   └ {LABELS[Cause(r.failure)]}：{r.failure_detail}", markup=False)
 
     try:
-        for attempt in range(1, repeat + 1):  # 一轮一轮地跑：中途停下时，每道题跑过的次数差不多
-            for task in tasks:
-                with console.status(f"{task.id}（第 {attempt}/{repeat} 轮）…"):
-                    results.append(run_task(task, lambda: provider(settings), settings, run_dir, attempt=attempt))
-                r = results[-1]
-                console.print(f"{'✅' if r.passed else '❌'} {r.id}  {r.agent_status}  {r.seconds}s  {r.check_detail}",
-                              markup=False)
-                save_report(run_dir, results, meta)
+        with status:
+            rep = run_eval(tasks, lambda: provider(settings), settings, run_dir, repeat=repeat, jobs=jobs, meta=meta,
+                           on_start=on_start, on_result=on_result)
     except KeyboardInterrupt:
-        raise fail(f"已中断，做完的 {len(results)} 道题在 {run_dir / 'report.json'}", EXIT_INTERRUPTED) from None
+        raise fail(f"已中断，做完的 {done} 次在 {run_dir / 'report.json'}", EXIT_INTERRUPTED) from None
 
-    rep = save_report(run_dir, results, meta)
     table = Table("指标", "值")
     for k in ("tasks", "runs", "pass_rate", "injection_induced_rate", "avg_llm_calls", "total_tokens"):
         table.add_row(k, str(rep[k]))
     console.print(table)
+    if rep["failures"]:
+        failures = Table("没通过的原因", "次数")
+        for cause, count in rep["failures"].items():
+            failures.add_row(LABELS[Cause(cause)], str(count))
+        console.print(failures)
+    if rep["interrupted_runs"]:
+        console.print(f"[yellow]有 {rep['interrupted_runs']} 次运行因为模型接口出错或被停止没有跑完，"
+                      "通过率里照常算；要比较的话把这几次重跑[/]")
     if repeat > 1:
         per_task = Table("题目", "通过", "被诱导", "平均轮数", "平均 token")
         for t in rep["per_task"]:

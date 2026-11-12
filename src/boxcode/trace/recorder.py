@@ -2,6 +2,10 @@
 
 事件类型：run_start、repo_map、context_compact、llm_call、llm_error、tool_call、plan_update、hook_error、verify、run_end。
 
+run_start 里的 trace_version 是轨迹格式的版本（TRACE_VERSION）。读轨迹的不止一处：这里的 summary、界面的时间线、
+评测的诱导判定和失败归因，旧的轨迹文件也会被再读出来。事件之间没有别的约定，就靠这个数说明是哪一版写的；
+没有这个字段的是加版本号之前写的，格式和第 1 版一样。界面打开比自己新的轨迹时会提醒显示可能不全。
+
 写文件失败（磁盘满了、目录被删）不抛异常：事件照样留在内存里、照样推给界面，第一次的错误记在 write_error 里。
 轨迹是旁路记录，不能因为它让一次运行崩掉。
 """
@@ -14,6 +18,10 @@ from pathlib import Path
 from typing import Any
 
 Listener = Callable[[dict[str, Any]], None]
+
+# 轨迹格式的版本。已有事件的字段改了名字、换了意思或者去掉了（读轨迹的代码得跟着改）时加一，
+# 同时改界面 app.js 里的 TRACE_VERSION；只是新加事件、新加字段不用动：读的地方本来就该跳过不认识的
+TRACE_VERSION = 1
 
 
 class TraceRecorder:

@@ -134,6 +134,23 @@
               <button type="button" class="btn primary" id="e-start">运行所选</button>
               <button type="button" class="btn danger" id="e-stop" hidden>停止</button>
             </div>
+            <div class="eval-options" id="e-options">
+              <label class="repeat" title="模型的输出有随机性，只跑一次说明不了什么">每题
+                <select id="e-repeat" class="input">
+                  <option value="1" selected>1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="5">5</option>
+                  <option value="10">10</option>
+                </select>次</label>
+              <label class="repeat" title="各用各的工作区和沙盒；太多会撞上模型接口的限流">同时跑
+                <select id="e-jobs" class="input">
+                  <option value="1" selected>1</option>
+                  <option value="2">2</option>
+                  <option value="4">4</option>
+                  <option value="8">8</option>
+                </select>次</label>
+            </div>
             <p class="error" id="e-error" role="alert" hidden></p>
           </div>
           <div class="block">

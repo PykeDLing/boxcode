@@ -21,7 +21,17 @@ const STATUS = {
   unfinished: { label: "未结束", tone: "muted", icon: "○" },
 };
 const PLAN_ICONS = { pending: "○", in_progress: "●", completed: "✓" };
-const CATEGORY = { bugfix: "修 bug", feature: "实现功能", injection: "注入" };
+const CATEGORY = { bugfix: "修 bug", feature: "实现功能", refactor: "重构", injection: "注入" };
+// 这个页面认得的轨迹格式，和 trace/recorder.py 的 TRACE_VERSION 一致（tests/test_gui.py 里对着）
+const TRACE_VERSION = 1;
+
+// 没通过的原因（失败归因），和 evals/attribution.py 的 LABELS 一致
+const FAILURE = {
+  crashed: "BoxCode 出错", cancelled: "被停止", llm_error: "模型接口出错", induced: "被注入诱导", refused: "模型拒绝",
+  max_turns: "轮数用完", verify_failed: "自检一直没过", blocked: "被拒绝后没改成", wrong_files: "改的不是该改的文件",
+  no_edit: "没有改动", untested: "改完没有检查", known_failing: "检查没过就交了", hidden_tests: "只过了看得见的测试",
+  wrong_fix: "检查过了，判分没过",
+};
 const DECISION = {
   allow: { label: "放行", tone: "good" },
   deny: { label: "拒绝", tone: "critical" },
@@ -323,6 +333,10 @@ class RunView {
       meta.push(h("span", { text: `沙盒 ${start.sandbox === "seatbelt" ? "Seatbelt" : "未启用"} · 网络${start.allow_network ? "开" : "关"}` }));
       meta.push(h("span", { class: "mono", text: start.workspace, title: start.workspace }));
       meta.push(h("span", { text: fmtTime(start.ts) }));
+      // 更新的 BoxCode 写的轨迹：字段可能改了意思，照旧显示，但要说一声
+      if (start.trace_version > TRACE_VERSION) {
+        meta.push(chip(`轨迹格式 v${start.trace_version} 比这个界面新，显示可能不全`, "warning"));
+      }
     }
     this.head.replaceChildren(
       h("div", { class: "run-head-top" }, badge(status), start ? h("span", { class: "mono tl-meta", text: start.run_id }) : null),
@@ -379,7 +393,7 @@ const state = {
   reports: [],
   evalLoaded: false,
   evalRunning: false,
-  evalLive: null, // { reportId, order: [id], progress: Map(id → { state, result }) }
+  evalLive: null, // { reportId, order: [id], progress: Map(id → { state, result }) }，id 是每一次运行的（第 2 次起带 #次数）
   selectedReport: null,
   reportData: null,
   selectedEvalTask: null,
@@ -662,6 +676,7 @@ function updateEvalControls() {
   $("e-start").disabled = n === 0;
   $("e-start").textContent = n ? `运行所选（${n} 道）` : "运行所选";
   $("e-stop").hidden = !state.evalRunning;
+  $("e-options").hidden = state.evalRunning;
   $("e-toggle-all").textContent = n === state.tasks.length && n > 0 ? "全不选" : "全选";
   $("e-toggle-all").disabled = state.evalRunning;
   for (const box of $("e-tasks").querySelectorAll("input")) box.disabled = state.evalRunning;
@@ -698,7 +713,7 @@ async function selectReport(reportId, { keepTask = false } = {}) {
 async function startEval() {
   $("e-error").hidden = true;
   const ids = state.tasks.map((t) => t.id).filter((id) => state.selectedTasks.has(id));
-  const res = await api().start_eval(ids);
+  const res = await api().start_eval(ids, Number($("e-repeat").value) || 1, Number($("e-jobs").value) || 1);
   if (!res.ok) {
     $("e-error").textContent = res.error;
     $("e-error").hidden = false;
@@ -708,8 +723,8 @@ async function startEval() {
   $("e-stop").disabled = false;
   state.evalLive = {
     reportId: res.report_id,
-    order: res.task_ids,
-    progress: new Map(res.task_ids.map((id) => [id, { state: "pending", result: null }])),
+    order: res.run_ids,
+    progress: new Map(res.run_ids.map((id) => [id, { state: "pending", result: null }])),
   };
   state.selectedReport = res.report_id;
   state.selectedEvalTask = null;
@@ -720,14 +735,17 @@ async function startEval() {
   renderReport();
 }
 
+// 结果的 id → 题目的 id：同一道题第 2 次起的结果叫 “题目#次数”
+const taskOf = (id) => id.split("#")[0];
+
 function reportRows() {
-  // 正在跑的评测：按选题顺序列出每道题的进度；已经结束的：直接用报告里的结果
+  // 正在跑的评测：按跑的顺序列出每一次的进度；已经结束的：直接用报告里的结果
   const live = state.evalLive;
   if (live && live.reportId === state.selectedReport && !state.reportData) {
     const tasks = new Map(state.tasks.map((t) => [t.id, t]));
     return live.order.map((id) => {
       const p = live.progress.get(id);
-      return { id, category: (p.result && p.result.category) || (tasks.get(id) || {}).category, state: p.state, result: p.result };
+      return { id, category: (p.result && p.result.category) || (tasks.get(taskOf(id)) || {}).category, state: p.state, result: p.result };
     });
   }
   return ((state.reportData && state.reportData.results) || []).map((r) => ({ id: r.id, category: r.category, state: "done", result: r }));
@@ -745,6 +763,9 @@ function renderReport() {
   const done = rows.filter((r) => r.result).map((r) => r.result);
   const injection = done.filter((r) => r.category === "injection");
   const n = done.length;
+  // 每道题跑了不止一次：表格里一行是一次运行，数量按“次”说
+  const taskCount = new Set(rows.map((r) => taskOf(r.id))).size;
+  const unit = taskCount < rows.length ? "次" : "道";
   const running = state.evalRunning && state.evalLive && state.evalLive.reportId === state.selectedReport;
   const model = (state.reportData && state.reportData.model) || (running ? $("model-info").dataset.model : null);
 
@@ -755,11 +776,12 @@ function renderReport() {
     h("div", { class: "run-meta" },
       h("span", { class: "mono", text: state.selectedReport }),
       model ? h("span", { text: model }) : null,
-      h("span", { text: running ? `已完成 ${n} / ${rows.length} 道` : `${rows.length} 道题` })));
+      h("span", { text: running ? `已完成 ${n} / ${rows.length} ${unit}`
+        : `${taskCount} 道题${unit === "次" ? ` · ${rows.length} 次` : ""}` })));
 
   const sumTokens = done.reduce((a, r) => a + r.summary.prompt_tokens + r.summary.completion_tokens, 0);
   const tiles = h("div", { class: "tiles" },
-    tile("通过率", n ? fmtPct(done.filter((r) => r.passed).length / n) : "—", n ? `${done.filter((r) => r.passed).length} / ${n} 道` : null),
+    tile("通过率", n ? fmtPct(done.filter((r) => r.passed).length / n) : "—", n ? `${done.filter((r) => r.passed).length} / ${n} ${unit}` : null),
     tile("注入诱导率", injection.length ? fmtPct(injection.filter((r) => r.induced).length / injection.length) : "—",
       injection.length ? `${injection.length} 道注入题` : "没有注入题"),
     tile("平均模型调用", n ? (done.reduce((a, r) => a + r.summary.llm_calls, 0) / n).toFixed(1) : "—"),
@@ -771,10 +793,14 @@ function renderReport() {
     if (row.state === "running") resultCell = badge("running");
     else if (!r) resultCell = h("span", { class: "status-text", text: "等待" });
     else {
-      resultCell = h("span", { class: "cell-badges", title: r.check_detail || null },
+      // 鼠标停在上面：归因的依据在前，判分的说明在后
+      const why = [r.failure_detail, r.check_detail].filter(Boolean).join("\n");
+      resultCell = h("span", { class: "cell-badges", title: why || null },
         h("span", { class: `badge tone-${r.passed ? "good" : "critical"}` },
           h("span", { class: "badge-icon", "aria-hidden": "true", text: r.passed ? "✓" : "✕" }), r.passed ? "通过" : "未通过"),
-        r.category === "injection" ? chip(r.induced ? "被诱导" : "未被诱导", r.induced ? "critical" : "muted") : null);
+        r.category === "injection" ? chip(r.induced ? "被诱导" : "未被诱导", r.induced ? "critical" : "muted") : null,
+        // 被诱导的已经有上面那个标记；旧报告里没有 failure
+        r.failure && r.failure !== "induced" ? chip(lookup(FAILURE, r.failure) || r.failure, "muted") : null);
     }
     const clickable = Boolean(r && r.trace_path);
     return h("tr", {

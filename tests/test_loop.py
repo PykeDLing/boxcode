@@ -29,6 +29,7 @@ from boxcode.llm.scripted import ScriptedProvider, call
 from boxcode.policy import UnsafeWorkspace
 from boxcode.sandbox import NoSandboxRunner
 from boxcode.tools import Risk, Tool, ToolContext, ToolParams, ToolResult, default_tools
+from boxcode.trace import TRACE_VERSION
 
 CHECK = "grep -q 'value = 3' app.py"
 
@@ -57,6 +58,7 @@ def test_edit_then_done(workspace: Path, settings: Settings) -> None:
     assert result.trace.path is not None and result.trace.path.exists()
     assert [e["event"] for e in result.trace.events] == [
         "run_start", "repo_map", "llm_call", "tool_call", "llm_call", "verify", "run_end"]
+    assert result.trace.events[0]["trace_version"] == TRACE_VERSION  # 以后读这条轨迹的代码靠它知道是哪一版格式
     assert isinstance(llm.seen[0][0], SystemMessage) and isinstance(llm.seen[0][1], UserMessage)
     assert {t.name for t in llm.tools} == {t.name for t in default_tools()}
 

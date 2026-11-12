@@ -81,15 +81,22 @@ def test_unsafe_workspace_refused_before_running(monkeypatch: pytest.MonkeyPatch
 def test_eval_report_records_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, home: Path) -> None:
     monkeypatch.setenv("BOXCODE_EFFORT", "low")
     monkeypatch.setenv("BOXCODE_PLANNING", "false")
+    monkeypatch.setenv("BOXCODE_PROMPT_SKIP", "security")
     monkeypatch.setattr(cli, "make_provider", lambda _: ScriptedProvider([LLMResponse("done")]))
     tasks = Path(__file__).parent.parent / "evals" / "tasks"
     r = CliRunner().invoke(cli.app, ["eval", "--tasks", str(tasks), "--only", "001-fix-moving-average",
-                                     "--out", str(tmp_path / "results")])
+                                     "--out", str(tmp_path / "results"), "--repeat", "2", "--jobs", "2"])
     assert r.exit_code == 0, r.output
     (report_path,) = (tmp_path / "results").glob("*/report.json")
     rep = json.loads(report_path.read_text())
     assert (rep["config"]["effort"], rep["config"]["planning"]) == ("low", False)
-    assert set(rep["boxcode"]) == {"version", "commit", "dirty"} and rep["runs"] == 1
+    assert rep["config"]["prompt_skip"] == ["security"]  # 对比实验的开关走环境变量，报告里记着
+    assert set(rep["boxcode"]) == {"version", "commit", "dirty"}
+    assert (rep["tasks"], rep["runs"]) == (1, 2) and [x["id"] for x in rep["results"]][1].endswith("#2")
+    assert rep["jobs"] == 2  # 同时跑几次也记着：机器忙的时候每一次的耗时会变长
+    # 剧本模型什么都没改：这一题没通过，原因写在那一行下面，最后有一张按原因统计的表
+    assert rep["failures"] == {"no_edit": 2} and rep["interrupted_runs"] == 0
+    assert "└ 没有改动" in r.output and "没通过的原因" in r.output
 
 
 def test_version() -> None:

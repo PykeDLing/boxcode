@@ -32,7 +32,7 @@ from pydantic import BaseModel, ValidationError
 
 from boxcode.agent import Agent
 from boxcode.config import Settings
-from boxcode.evals import Task, TaskResult, load_tasks, run_meta, run_task, save_report
+from boxcode.evals import Task, TaskResult, load_tasks, new_run_dir, result_id, run_eval
 from boxcode.llm.base import LLMProvider, LLMUnavailable
 from boxcode.llm.factory import make_provider
 from boxcode.policy import ApprovalMode, Decision, ExecutionPolicy
@@ -46,6 +46,10 @@ RUN_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 REPORT_ID = re.compile(r"\d{8}-\d{6}")
 # 历史轨迹列表最多显示这么多条
 MAX_RUNS = 200
+# 评测时每道题最多跑这么多次
+MAX_EVAL_REPEAT = 20
+# 评测时最多同时跑这么多次
+MAX_EVAL_JOBS = 8
 SUMMARY_KEYS = ("llm_calls", "tool_calls", "prompt_tokens", "completion_tokens", "cached_tokens", "denied")
 REPORT_KEYS = ("model", "tasks", "pass_rate", "injection_induced_rate", "avg_llm_calls", "total_tokens")
 # 关窗口时最多等后台的运行和评测这么久，让它们写完 run_end
@@ -257,9 +261,13 @@ class GuiApi:
             return []
         return [{"id": t.id, "category": t.category, "prompt": t.prompt} for t in load_tasks(self._tasks_dir)]
 
-    def start_eval(self, task_ids: list[str]) -> dict[str, Any]:
+    def start_eval(self, task_ids: list[str], repeat: int = 1, jobs: int = 1) -> dict[str, Any]:
         if not isinstance(task_ids, list) or not all(isinstance(t, str) for t in task_ids):
             return _fail("参数不对：task_ids 要是题目 id 的列表")
+        if type(repeat) is not int or not 1 <= repeat <= MAX_EVAL_REPEAT:  # 页面传来的是 JSON：true、"3" 都不算
+            return _fail(f"每道题跑的次数要是 1 到 {MAX_EVAL_REPEAT} 的整数")
+        if type(jobs) is not int or not 1 <= jobs <= MAX_EVAL_JOBS:
+            return _fail(f"同时跑的次数要是 1 到 {MAX_EVAL_JOBS} 的整数")
         with self._lock:
             if self._eval_busy:
                 return _fail("已经有一轮评测在运行")
@@ -270,35 +278,35 @@ class GuiApi:
                 self._make_llm(self._settings)  # 先检查一次配置，没有 key 就不开始
             except LLMUnavailable as e:
                 return _fail(str(e))
-            report_id, run_dir = _new_report_dir(self._results_dir)
+            run_dir = new_run_dir(self._results_dir)
             self._eval_stop = threading.Event()
             self._eval_busy = True
-            self._eval = threading.Thread(target=self._do_eval, args=(tasks, run_dir, self._eval_stop), daemon=True)
+            self._eval = threading.Thread(target=self._do_eval, args=(tasks, repeat, jobs, run_dir, self._eval_stop),
+                                          daemon=True)
             self._eval.start()
-        return {"ok": True, "report_id": report_id, "task_ids": [t.id for t in tasks]}
+        # run_ids：这一轮要跑的每一次，按排的顺序；eval_progress 里的 task_id 就是其中一个
+        return {"ok": True, "report_id": run_dir.name, "task_ids": [t.id for t in tasks],
+                "run_ids": [result_id(t.id, attempt) for attempt in range(1, repeat + 1) for t in tasks]}
 
-    def _do_eval(self, tasks: list[Task], run_dir: Path, stop: threading.Event) -> None:
+    def _do_eval(self, tasks: list[Task], repeat: int, jobs: int, run_dir: Path, stop: threading.Event) -> None:
         report_id = run_dir.name
-        results: list[TaskResult] = []
 
         def make_llm() -> LLMProvider:
             return self._make_llm(self._settings)
+
+        def on_start(task: Task, attempt: int) -> None:
+            self._send("eval_progress", report_id=report_id, task_id=result_id(task.id, attempt), state="running")
+
+        def on_result(result: TaskResult) -> None:
+            self._send("eval_progress", report_id=report_id, task_id=result.id, state="done", result=asdict(result))
 
         def done() -> None:
             with self._lock:
                 self._eval_busy = False
 
         try:
-            meta = run_meta(self._settings)
-            for task in tasks:
-                if stop.is_set():
-                    break
-                self._send("eval_progress", report_id=report_id, task_id=task.id, state="running")
-                results.append(run_task(task, make_llm, self._settings, run_dir, cancel=stop))
-                save_report(run_dir, results, meta)
-                self._send("eval_progress", report_id=report_id, task_id=task.id, state="done",
-                           result=asdict(results[-1]))
-            rep = save_report(run_dir, results, meta)
+            rep = run_eval(tasks, make_llm, self._settings, run_dir, repeat=repeat, jobs=jobs, cancel=stop,
+                           on_start=on_start, on_result=on_result)
             done()
             self._send("eval_finished", report_id=report_id, stopped=stop.is_set(), report=rep)
         except Exception as e:
@@ -307,7 +315,7 @@ class GuiApi:
             self._send("eval_finished", report_id=report_id, stopped=True, error=f"{type(e).__name__}: {e}")
 
     def stop_eval(self) -> None:
-        """当前这道题以 cancelled 结束（正在跑的命令和判分都会被杀掉，记成没通过），后面的题不再开始。"""
+        """正在做的每一次都以 cancelled 结束（正在跑的命令和判分都会被杀掉，记成没通过），后面的不再开始。"""
         self._eval_stop.set()
 
     def list_reports(self) -> list[dict[str, Any]]:
@@ -343,19 +351,6 @@ class GuiApi:
         for thread in (self._run, self._eval):
             if thread is not None:
                 thread.join(max(0.0, deadline - time.monotonic()))
-
-
-def _new_report_dir(results_dir: Path) -> tuple[str, Path]:
-    """评测结果目录按秒命名；同一秒里开了两轮，第二轮等到下一秒，不和第一轮混在一起。"""
-    while True:
-        report_id = time.strftime("%Y%m%d-%H%M%S")
-        run_dir = results_dir / report_id
-        try:
-            run_dir.mkdir(parents=True)
-        except FileExistsError:
-            time.sleep(0.2)
-            continue
-        return report_id, run_dir
 
 
 def bridge_functions(api: GuiApi, token: str) -> list[Callable[..., Any]]:
