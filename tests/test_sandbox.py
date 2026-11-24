@@ -174,6 +174,27 @@ def test_dotenv_readable_only_inside_workspace(workspace: Path, tmp_path: Path) 
 
 
 @macos_only
+@pytest.mark.parametrize("command", [
+    "mv ../.env ../env.txt; cat ../env.txt",  # 改了名字，按名字挡的那条读规则就对不上了（实测读得到）
+    "mv ../.env ./stolen.txt; cat ./stolen.txt",
+    "/usr/bin/python3 -c \"import os; os.rename('../.env', '../e.txt'); print(open('../e.txt').read())\"",
+    "rm -f ../.env",
+    "echo overwritten > ../.env",
+])
+def test_dotenv_outside_workspace_cannot_be_renamed_or_removed(workspace: Path, command: str) -> None:
+    # pytest 的临时目录在 /private/var/folders 下面，沙盒能写：只挡读的话，改个名字就读到了
+    secret = workspace.parent / ".env"
+    secret.write_text("OTHER_SECRET")
+    r = SeatbeltRunner(workspace).run(command, workspace, 10)
+    assert "OTHER_SECRET" not in r.stdout
+    assert secret.read_text() == "OTHER_SECRET" and sorted(p.name for p in workspace.parent.iterdir()) == [".env", "ws"]
+    # 工作区自己的 .env 照常能改名、能删
+    own = SeatbeltRunner(workspace).run("echo OWN > .env && mv .env .env.bak && cat .env.bak && rm .env.bak",
+                                        workspace, 10)
+    assert own.ok and "OWN" in own.stdout
+
+
+@macos_only
 def test_network_off_by_default(workspace: Path) -> None:
     py = "import socket; socket.create_connection(('1.1.1.1', 80), timeout=3); print('connected')"
     r = SeatbeltRunner(workspace).run(f"/usr/bin/python3 -c \"{py}\"", workspace, 15)

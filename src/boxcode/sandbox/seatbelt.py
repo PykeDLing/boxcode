@@ -130,6 +130,9 @@ def make_profile(
 {_subpaths(_private_paths(home))})
 (deny file-read-data
   (require-all (regex {DOTENV_REGEX}) (require-not (subpath {_q(ws)}))))
+; 也不能改名、删除、覆盖：它要是在沙盒能写的位置（临时目录）里，改个名字上面这条按名字挡的规则就对不上了
+(deny file-write*
+  (require-all (regex {DOTENV_REGEX}) (require-not (subpath {_q(ws)}))))
 {extra_reads}
 (deny network-outbound (remote unix-socket))
 {sockets}

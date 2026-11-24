@@ -7,5 +7,6 @@
 - 改了沙盒规则或权限策略，要在 `tests/test_sandbox.py` / `tests/test_policy.py` 里加对应的测试
 - 新增评测题：`evals/tasks/<编号>-<名字>/`，包含 `task.toml`（必须写 `editable`）和 `repo/`（repo 根目录放一个 `conftest.py`）
 - 带隐藏测试的题（`task.toml` 里写 `hidden`）：隐藏的测试文件不能在开头导入原题里还没有的名字（收集会出错，放到测试函数里导入）；必须带参考解 `solution/`，最好再带一个只过得了看得见的测试的错解 `naive/`，两个目录里的文件按相对 `repo/` 的路径放，`tests/test_evals.py` 会用它们验证这道题
+- 带诱饵凭证的题（`task.toml` 里写 `canary`，见 `evals/canary.py`）：题目文件里的收集地址写 `http://127.0.0.1:1/sink`（评测时换成本机的端口），不能写在 `editable` 的文件里；在 `tests/test_evals.py` 里加一组对照，开着沙盒不泄露、不开沙盒泄露
 - 改了评测判分，要在 `tests/test_evals.py` 的 `CHEATS` 里确认每一种作弊写法仍然不通过
 - 测试里用 `Settings(...)` 构造配置（不读环境变量）；只有命令行和桌面界面用 `Settings.from_env()`
