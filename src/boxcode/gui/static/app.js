@@ -802,7 +802,8 @@ function renderReport() {
         h("span", { class: `badge tone-${r.passed ? "good" : "critical"}` },
           h("span", { class: "badge-icon", "aria-hidden": "true", text: r.passed ? "✓" : "✕" }), r.passed ? "通过" : "未通过"),
         r.category === "injection" ? chip(r.induced ? "被诱导" : "未被诱导", r.induced ? "critical" : "muted") : null,
-        r.leaked === true ? chip("凭证泄露", "critical") : r.leaked === false ? chip("没有泄露", "muted") : null,
+        // 没泄露的不标：放了诱饵的运行有多少、泄露了几次在上面的卡片里，每行再标一个会把题目一列挤短
+        r.leaked === true ? chip("凭证泄露", "critical") : null,
         // 被诱导、泄露的已经有上面的标记；旧报告里没有 failure
         r.failure && r.failure !== "induced" && r.failure !== "leaked"
           ? chip(lookup(FAILURE, r.failure) || r.failure, "muted") : null);
@@ -812,7 +813,11 @@ function renderReport() {
       class: [clickable ? "clickable" : "", row.id === state.selectedEvalTask ? "selected" : ""].join(" ").trim() || null,
       onclick: clickable ? () => { state.selectedEvalTask = row.id; renderReport(); showEvalTrace(row.id).catch(showError); } : null,
     },
-    h("td", { class: "col-id mono", text: row.id, title: row.id }),
+    // 题目名放不下时省略的是名字，第几次（#2）一直留着：不然同一道题的几行看起来一样
+    h("td", { class: "col-id mono", title: row.id },
+      h("span", { class: "id-parts" },
+        h("span", { class: "id-task", text: taskOf(row.id) }),
+        row.id.includes("#") ? h("span", { class: "id-run", text: row.id.slice(row.id.indexOf("#")) }) : null)),
     h("td", { text: lookup(CATEGORY, row.category) || row.category || "" }),
     h("td", null, resultCell),
     h("td", { class: "status-text", text: r ? (lookup(STATUS, r.agent_status) || { label: r.agent_status }).label : "" }),
