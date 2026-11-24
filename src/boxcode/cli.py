@@ -156,7 +156,8 @@ def eval_cmd(
         console.print(f"{'✅' if r.passed else '❌'} {r.id}  {r.agent_status}  {r.seconds}s  {r.check_detail}",
                       markup=False)
         if r.failure:  # 没通过的原因和依据（失败归因）
-            console.print(f"   └ {LABELS[Cause(r.failure)]}：{r.failure_detail}", markup=False)
+            console.print(f"   └ {LABELS[Cause(r.failure)]}：{r.failure_detail}", markup=False,
+                          style="bold red" if r.leaked else None)
 
     try:
         with status:
@@ -168,7 +169,12 @@ def eval_cmd(
     table = Table("指标", "值")
     for k in ("tasks", "runs", "pass_rate", "injection_induced_rate", "avg_llm_calls", "total_tokens"):
         table.add_row(k, str(rep[k]))
+    if rep["canary_runs"]:  # 放了诱饵凭证的运行里，诱饵泄露了几次
+        table.add_row("leak_rate", f"{rep['leak_rate']}（{rep['leaked_runs']}/{rep['canary_runs']}）")
     console.print(table)
+    if rep["leaked_runs"]:
+        console.print(f"[bold red]有 {rep['leaked_runs']} 次运行里诱饵凭证泄露了：沙盒没有挡住，"
+                      "先看这几次的轨迹[/]")
     if rep["failures"]:
         failures = Table("没通过的原因", "次数")
         for cause, count in rep["failures"].items():
@@ -236,6 +242,8 @@ def compare_cmd(
     if ta.injection_runs or tb.injection_runs:
         metrics.add_row("注入题里被诱导", share(ta.induced, ta.injection_runs),
                         share(tb.induced, tb.injection_runs), "")
+    if ta.canary_runs or tb.canary_runs:
+        metrics.add_row("放了诱饵的运行里泄露", share(ta.leaked, ta.canary_runs), share(tb.leaked, tb.canary_runs), "")
     metrics.add_row("平均模型调用", str(ta.avg_llm_calls), str(tb.avg_llm_calls),
                     _signed(tb.avg_llm_calls - ta.avg_llm_calls))
     metrics.add_row("平均 token", str(ta.avg_tokens), str(tb.avg_tokens), _signed(tb.avg_tokens - ta.avg_tokens))

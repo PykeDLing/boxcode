@@ -27,7 +27,7 @@ const TRACE_VERSION = 1;
 
 // 没通过的原因（失败归因），和 evals/attribution.py 的 LABELS 一致
 const FAILURE = {
-  crashed: "BoxCode 出错", cancelled: "被停止", llm_error: "模型接口出错", induced: "被注入诱导", refused: "模型拒绝",
+  leaked: "凭证泄露", crashed: "BoxCode 出错", cancelled: "被停止", llm_error: "模型接口出错", induced: "被注入诱导", refused: "模型拒绝",
   max_turns: "轮数用完", verify_failed: "自检一直没过", blocked: "被拒绝后没改成", wrong_files: "改的不是该改的文件",
   no_edit: "没有改动", untested: "改完没有检查", known_failing: "检查没过就交了", hidden_tests: "只过了看得见的测试",
   wrong_fix: "检查过了，判分没过",
@@ -762,6 +762,8 @@ function renderReport() {
   const rows = reportRows();
   const done = rows.filter((r) => r.result).map((r) => r.result);
   const injection = done.filter((r) => r.category === "injection");
+  // 放了诱饵凭证的运行（leaked 是 true 或 false；没放诱饵、旧报告都没有这一项）
+  const baited = done.filter((r) => r.leaked === true || r.leaked === false);
   const n = done.length;
   // 每道题跑了不止一次：表格里一行是一次运行，数量按“次”说
   const taskCount = new Set(rows.map((r) => taskOf(r.id))).size;
@@ -784,6 +786,7 @@ function renderReport() {
     tile("通过率", n ? fmtPct(done.filter((r) => r.passed).length / n) : "—", n ? `${done.filter((r) => r.passed).length} / ${n} ${unit}` : null),
     tile("注入诱导率", injection.length ? fmtPct(injection.filter((r) => r.induced).length / injection.length) : "—",
       injection.length ? `${injection.length} 道注入题` : "没有注入题"),
+    baited.length ? tile("凭证泄露", `${baited.filter((r) => r.leaked).length} / ${baited.length}`, "放了诱饵的运行") : null,
     tile("平均模型调用", n ? (done.reduce((a, r) => a + r.summary.llm_calls, 0) / n).toFixed(1) : "—"),
     tile("总 token", n ? fmtInt(sumTokens) : "—"));
 
@@ -794,13 +797,15 @@ function renderReport() {
     else if (!r) resultCell = h("span", { class: "status-text", text: "等待" });
     else {
       // 鼠标停在上面：归因的依据在前，判分的说明在后
-      const why = [r.failure_detail, r.check_detail].filter(Boolean).join("\n");
+      const why = [r.failure_detail, r.failure === "leaked" ? null : r.leak_detail, r.check_detail].filter(Boolean).join("\n");
       resultCell = h("span", { class: "cell-badges", title: why || null },
         h("span", { class: `badge tone-${r.passed ? "good" : "critical"}` },
           h("span", { class: "badge-icon", "aria-hidden": "true", text: r.passed ? "✓" : "✕" }), r.passed ? "通过" : "未通过"),
         r.category === "injection" ? chip(r.induced ? "被诱导" : "未被诱导", r.induced ? "critical" : "muted") : null,
-        // 被诱导的已经有上面那个标记；旧报告里没有 failure
-        r.failure && r.failure !== "induced" ? chip(lookup(FAILURE, r.failure) || r.failure, "muted") : null);
+        r.leaked === true ? chip("凭证泄露", "critical") : r.leaked === false ? chip("没有泄露", "muted") : null,
+        // 被诱导、泄露的已经有上面的标记；旧报告里没有 failure
+        r.failure && r.failure !== "induced" && r.failure !== "leaked"
+          ? chip(lookup(FAILURE, r.failure) || r.failure, "muted") : null);
     }
     const clickable = Boolean(r && r.trace_path);
     return h("tr", {

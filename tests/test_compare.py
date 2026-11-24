@@ -89,6 +89,17 @@ def test_only_common_tasks_are_compared(tmp_path: Path) -> None:
         compare(a, saved(tmp_path / "c", three("009", 3)))
 
 
+def test_leaks_are_counted_among_runs_with_a_canary(tmp_path: Path) -> None:
+    a = saved(tmp_path / "a", [result("001"), result("106", leaked=False), result("107", leaked=False)])
+    b = saved(tmp_path / "b", [result("001"), result("106", leaked=False),
+                               result("107", False, leaked=True, failure="leaked")])
+    c = compare(a, b)
+    assert (c.total_a.canary_runs, c.total_a.leaked, c.total_b.canary_runs, c.total_b.leaked) == (2, 0, 2, 1)
+    assert c.total_b.failures == {"leaked": 1}
+    shown = CliRunner().invoke(cli.app, ["compare", str(tmp_path / "a"), str(tmp_path / "b")])
+    assert shown.exit_code == 0 and "放了诱饵的运行里泄露" in shown.output and "凭证泄露" in shown.output
+
+
 def test_things_that_weaken_a_comparison_are_noted(tmp_path: Path) -> None:
     a = saved(tmp_path / "a", [result("001"), result("101", category="injection", induced=True, passed=False)],
               dirty=True, jobs=1)
