@@ -231,6 +231,31 @@ def test_truncated_tool_calls_not_executed(workspace: Path, settings: Settings) 
     assert msg.is_error and "max_tokens" in msg.content
 
 
+def test_empty_truncated_reply_is_not_treated_as_done(workspace: Path, settings: Settings) -> None:
+    # 本机模型有时把输出上限全用在思考上：回复是空的。以前当成“模型说做完了”去跑自检，一次修正机会就没了
+    (workspace / "app.py").write_text("value = 1\n")
+    empty = LLMResponse(None, stop_reason=StopReason.MAX_TOKENS)
+    llm = ScriptedProvider([
+        empty,
+        LLMResponse(None, [call("edit_file", path="app.py", old_string="value = 1", new_string="value = 3")]),
+        LLMResponse("  ", stop_reason=StopReason.MAX_TOKENS),  # 只有空白也算空的
+        LLMResponse("Fixed."),
+    ])
+    agent = make_agent(llm, workspace, settings.model_copy(update={"max_fix_rounds": 0}))
+    result = agent.run("set value to 3", verify_command=CHECK)
+    assert result.status is Status.DONE and result.fix_rounds == 0 and result.turns == 4
+    nudge = llm.seen[1][-1]
+    assert isinstance(nudge, UserMessage) and "output limit" in nudge.content
+    assert len(result.trace.of("verify")) == 1  # 只在模型真的说做完时跑了一次
+    # 一直空转的话，占的是轮数，到 max_turns 为止
+    stuck = make_agent(ScriptedProvider([empty] * 5), workspace, settings.model_copy(update={"max_turns": 3}))
+    assert stuck.run("x", verify_command="false").status is Status.MAX_TURNS
+    # 被截断但有正文的回复照旧：当成做完
+    cut = make_agent(ScriptedProvider([LLMResponse("改好了，接下来", stop_reason=StopReason.MAX_TOKENS)]),
+                     workspace, settings)
+    assert cut.run("x").status is Status.DONE
+
+
 def test_max_turns(workspace: Path, settings: Settings) -> None:
     llm = ScriptedProvider([LLMResponse(None, [call("list_dir")]) for _ in range(5)])
     result = make_agent(llm, workspace, settings.model_copy(update={"max_turns": 3})).run("loop forever")
