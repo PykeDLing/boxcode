@@ -117,6 +117,8 @@ export BOXCODE_MODEL=deepseek-chat
 mkdir -p ~/.boxcode && (umask 077; pbpaste > ~/.boxcode/api_key)   # 先复制 key；也可以用 BOXCODE_API_KEY
 # 小米 MiMo：BOXCODE_BASE_URL=https://api.xiaomimimo.com/v1，BOXCODE_MODEL=mimo-v2.6-flash，
 # 它默认开着深度思考并要求回传思考内容，BoxCode 没有回传，要加 export BOXCODE_THINKING=disabled
+# 本机 Ollama：BOXCODE_BASE_URL=http://127.0.0.1:11434/v1，BOXCODE_API_KEY 随便填一个；
+# 再加 export BOXCODE_MAX_OUTPUT_TOKENS=16384 BOXCODE_REQUEST_TIMEOUT=600（原因见“配置”）
 ```
 
 key 尽量不要放在环境变量里（包括写进 `~/.zshrc` 再 export）：沙盒里的命令能读到同一个用户下任何进程启动时的环境变量，这一点 Seatbelt 挡不住。`~/.config/anthropic` 和 `~/.boxcode` 沙盒里都读不到。
@@ -164,6 +166,8 @@ uv run boxcode gui
 | `BOXCODE_EFFORT` | `high` | Claude 的思考深度：`low` / `medium` / `high` / `xhigh` / `max` |
 | `BOXCODE_THINKING` | `default` | OpenAI 兼容接口的深度思考：`default` 由接口决定，`disabled` 在请求里关掉。小米 MiMo 默认开着思考，要设成 `disabled` |
 | `BOXCODE_STREAM` | `true` | OpenAI 兼容接口用不用流式输出。流式时按停止会断开连接，服务器不再往下生成；接口的流式工具调用不完整时设成 `false` |
+| `BOXCODE_REQUEST_TIMEOUT` | `120` | OpenAI 兼容接口等数据的超时（秒）；流式时是相邻两块数据之间的间隔。本机模型要调大，见下面的说明 |
+| `BOXCODE_MAX_OUTPUT_TOKENS` | `0` | OpenAI 兼容接口单轮最多输出多少 token（思考也算），`0` 表示不带上限、由接口决定 |
 | `BOXCODE_BASE_URL`、`BOXCODE_API_KEY` | | OpenAI 兼容接口的地址和 key；没设置 key 时读 `~/.boxcode/api_key` |
 | `BOXCODE_MAX_TURNS` | `30` | 最多调用模型几轮 |
 | `BOXCODE_MAX_FIX_ROUNDS` | `2` | 自检失败后最多再修几轮 |
@@ -176,6 +180,8 @@ uv run boxcode gui
 | `BOXCODE_HOME` | `~/.boxcode` | 执行轨迹存放位置 |
 
 值写错了（例如 `BOXCODE_MAX_TURNS=abc`、不认识的 `BOXCODE_PROVIDER`）启动时就会报出是哪个变量，退出码 2。
+
+用本机模型（Ollama）时要设 `BOXCODE_REQUEST_TIMEOUT` 和 `BOXCODE_MAX_OUTPUT_TOKENS`：Ollama 的工具调用是整个生成完才发出来的，写大文件的那一轮会有几分钟没有数据，默认的 120 秒不够；不设输出上限时，模型一旦空转会一直生成到把上下文写满（实测有一轮空转了 38 分钟）。
 
 ## 权限模式
 

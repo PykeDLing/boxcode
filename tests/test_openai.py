@@ -50,6 +50,14 @@ def test_messages_converted_and_native_content_dropped() -> None:
         {"type": "function", "function": {"name": "t", "description": "d", "parameters": {"type": "object"}}}]
 
 
+def test_empty_reply_is_sent_back_as_an_empty_string() -> None:
+    # 输出上限全被思考用完时，回复既没有正文也没有工具调用。把 null 原样发回去，Ollama 返回 400
+    # （invalid message content type: <nil>）：用本机模型跑评测时有两道题断在这里
+    out = convert_messages([UserMessage("task"), AssistantMessage(None), UserMessage("测试没过")])
+    assert out[1] == {"role": "assistant", "content": ""}
+    assert convert_messages([AssistantMessage("改好了")]) == [{"role": "assistant", "content": "改好了"}]
+
+
 def completion(finish_reason: str, usage: dict[str, Any] | None = None, **message: Any) -> ChatCompletion:
     return ChatCompletion.model_validate({
         "id": "x", "object": "chat.completion", "created": 0, "model": "m",
@@ -108,6 +116,25 @@ def test_thinking_disabled_only_when_asked(monkeypatch: pytest.MonkeyPatch) -> N
         monkeypatch.setattr(p._client.chat.completions, "create", create)
         p.complete([UserMessage("x")], [])
     assert [k["extra_body"] for k in sent] == [None, {"thinking": {"type": "disabled"}}]
+
+
+def test_output_cap_and_timeout_come_from_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 默认不带 max_tokens（由接口决定）、等 120 秒；本机模型要能设上限、把超时调大
+    sent: list[dict[str, Any]] = []
+
+    def create(**kwargs: Any) -> ChatCompletion:
+        sent.append(kwargs)
+        return completion("stop", content="ok")
+
+    timeouts = []
+    for settings in (Settings(api_key="k", stream=False),
+                     Settings(api_key="k", stream=False, max_output_tokens=4096, request_timeout_s=600)):
+        p = OpenAICompatProvider(settings)
+        timeouts.append(p._client.timeout)
+        monkeypatch.setattr(p._client.chat.completions, "create", create)
+        p.complete([UserMessage("x")], [])
+    assert sent[0]["max_tokens"] is openai.omit and sent[1]["max_tokens"] == 4096
+    assert timeouts == [120, 600]
 
 
 def test_missing_key_and_empty_choices(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -230,8 +257,8 @@ class Server:
         self.httpd.daemon_threads = True
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
-    def provider(self) -> OpenAICompatProvider:
-        return OpenAICompatProvider(Settings(api_key="k", model="m",
+    def provider(self, **settings: Any) -> OpenAICompatProvider:
+        return OpenAICompatProvider(Settings(api_key="k", model="m", **settings,
                                              base_url=f"http://127.0.0.1:{self.httpd.server_address[1]}/v1"))
 
     def close(self) -> None:
@@ -270,6 +297,10 @@ def test_streaming_request_over_a_real_connection(serve: Callable[..., Server]) 
     # 没有工具时请求里不带 tools：空列表在真实接口上是 400（用 Claude 的兼容接口实测的）
     server.provider().complete([UserMessage("x")], [])
     assert "tools" not in server.requests[1]
+    # 输出上限同理：默认不带，设了才出现在请求里
+    assert "max_tokens" not in request
+    server.provider(max_output_tokens=4096).complete([UserMessage("x")], [])
+    assert server.requests[2]["max_tokens"] == 4096
 
 
 def test_stop_closes_the_connection_mid_stream(serve: Callable[..., Server]) -> None:
@@ -319,6 +350,22 @@ def test_stopping_an_agent_run_drops_the_model_connection(serve: Callable[..., S
     threading.Thread(target=press_stop, daemon=True).start()
     assert agent.run("x").status is Status.CANCELLED
     assert server.disconnected.wait(10) and server.sent < 40
+
+
+def test_silence_longer_than_the_timeout_is_unavailable(serve: Callable[..., Server]) -> None:
+    # 超时管的是两块数据之间的间隔：开头来了一块，之后一直没有数据（Ollama 生成大段工具参数时就是这样）
+    release = threading.Event()
+
+    def reply(_: Server, send: Callable[[dict[str, Any] | str], None]) -> None:
+        send(REPLY[0])
+        release.wait(10)
+
+    server = serve(reply)
+    try:
+        with pytest.raises(LLMUnavailable, match="timed out"):
+            server.provider(request_timeout_s=1).complete([UserMessage("x")], [])
+    finally:
+        release.set()
 
 
 def test_connection_dropped_mid_stream_is_unavailable(serve: Callable[..., Server]) -> None:

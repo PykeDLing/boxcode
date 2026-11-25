@@ -34,6 +34,8 @@ ENV_VARS: dict[str, str] = {
     "effort": "BOXCODE_EFFORT",
     "thinking": "BOXCODE_THINKING",
     "stream": "BOXCODE_STREAM",
+    "request_timeout_s": "BOXCODE_REQUEST_TIMEOUT",
+    "max_output_tokens": "BOXCODE_MAX_OUTPUT_TOKENS",
     "home": "BOXCODE_HOME",
     "max_turns": "BOXCODE_MAX_TURNS",
     "max_fix_rounds": "BOXCODE_MAX_FIX_ROUNDS",
@@ -69,6 +71,12 @@ class Settings(BaseModel):
     # OpenAI 兼容接口用不用流式输出。流式时按停止能中途断开连接，剩下的输出不再生成；
     # 有的兼容接口流式的工具调用不完整、或者不认识 stream_options，这时关掉。Claude 一直是流式，不看这一项
     stream: bool = True
+    # OpenAI 兼容接口等数据最多等多久（秒）。流式时是相邻两块数据之间的间隔，不是整条回复的时间。
+    # 本机模型要调大：Ollama 的工具调用是整个生成完才发出来的，写一个大文件时会很久没有数据
+    request_timeout_s: int = Field(default=120, ge=1)
+    # OpenAI 兼容接口单轮最多输出多少 token（请求里的 max_tokens，思考也算在里面），0 表示不带、由接口决定。
+    # 本机模型要设：没有上限时，空转的模型会一直生成到把上下文写满
+    max_output_tokens: int = Field(default=0, ge=0)
     # 执行轨迹存在这里，不写进工作区
     home: Path = Field(default_factory=lambda: Path.home() / ".boxcode")
     max_turns: int = Field(default=30, ge=1)

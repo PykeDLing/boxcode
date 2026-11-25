@@ -68,7 +68,7 @@ Agent 主循环（agent/loop.py）
 
 - 对话历史是自己的类型（`llm/base.py`：`SystemMessage`、`UserMessage`、`AssistantMessage`、`ToolResultMessage`），每个 Provider 负责转成自己接口的格式。Claude 的原始内容块（含思考块）放在 `AssistantMessage.native` 里，只有 Claude Provider 会读并原样回传；历史只追加、不修改（压缩只改发给模型的副本，Claude 由服务器清理，见 4.5）
 - 一轮里模型可以并行调用多个工具，按顺序执行，结果都回给模型
-- 结束条件：模型不再调用工具，或达到 `max_turns`（默认 30）
+- 结束条件：模型不再调用工具，或达到 `max_turns`（默认 30）。有一种回复不算“不再调用工具”：撞上输出上限、既没有正文也没有工具调用（上限全用在了思考上，本机模型实测会这样）。这时告诉模型输出被截断了、让它接着做，占一轮，不去跑自检、不占修正机会
 - **反思纠错**：调用方给了 `verify` 命令（例如 `python -m pytest -q`）时，模型说做完后在沙盒里跑一遍；不通过就把输出作为新的用户消息交回去，最多 `max_fix_rounds` 轮（默认 2）。输出包在带随机后缀的 `<check_output_…>` 里、标明是数据：它以用户身份交回去，内容却来自仓库里的测试，测试的输出里写一个 `</check_output>` 也闭合不了。评测里可以关掉这一项，比较有无修正时的通过率
 - 工具出错（包括没预料到的异常，例如文件不是 UTF-8）、参数不对、被拒绝都不抛异常，而是作为工具结果回给模型，让它自己调整
 - 结束状态：`done`、`verify_failed`、`max_turns`、`refused`、`error`（模型接口出错，SDK 重试后仍失败）、`cancelled`（界面上按停止、命令行 Ctrl-C）、`crashed`（BoxCode 自己的 bug，`run_end` 里带完整异常栈）。不管哪种，`Agent.run` 都返回结果、轨迹里都有 `run_end`，评测和界面不用自己兜底

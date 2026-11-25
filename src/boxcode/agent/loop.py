@@ -49,6 +49,10 @@ from boxcode.trace import TRACE_VERSION, TraceRecorder
 Approver = Callable[[Tool[Any], BaseModel, Decision], bool]
 
 TRUNCATED_CALL = "输出撞上了 max_tokens，参数可能不完整，没有执行。请把大段内容拆成几次较小的写入。"
+# 输出上限用完了，回复里却什么都没有（给模型看的，用英文）
+TRUNCATED_EMPTY = ("Your last reply hit the output limit before it produced any answer or tool call, so nothing was "
+                   "done. Keep your reasoning short and continue with the next concrete step: call a tool, or say "
+                   "that the task is finished.")
 # 等模型回复时每隔这么久看一次有没有按停止
 CANCEL_POLL_S = 0.1
 
@@ -178,6 +182,11 @@ class Agent:
                 for call in resp.tool_calls:
                     result = ToolResult(TRUNCATED_CALL, ok=False) if resp.truncated else self._handle(call, state.turn)
                     state.messages.append(ToolResultMessage(call.id, result.text, is_error=not result.ok))
+                continue
+            if resp.stop_reason is StopReason.MAX_TOKENS and not (resp.content or "").strip():
+                # 输出上限全用在思考上，没有正文也没有工具调用：模型并没有说做完了。当成做完的话会去跑自检，
+                # 白白用掉一次修正机会（本机模型实测，一道题的 2 次机会都是这样用掉的）。占一轮，所以不会一直空转下去
+                state.messages.append(UserMessage(TRUNCATED_EMPTY))
                 continue
 
             # 模型认为做完了

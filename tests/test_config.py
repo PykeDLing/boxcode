@@ -26,6 +26,10 @@ def test_from_env_parses_and_derives_model() -> None:
     assert Settings.from_env({"BOXCODE_THINKING": "disabled"}).thinking == "disabled"
     # 流式默认开；有的兼容接口流式不完整，可以关
     assert Settings().stream is True and Settings.from_env({"BOXCODE_STREAM": "false"}).stream is False
+    # 本机模型用：等数据的超时、单轮输出上限（0 是不带上限）
+    assert (Settings().request_timeout_s, Settings().max_output_tokens) == (120, 0)
+    s = Settings.from_env({"BOXCODE_REQUEST_TIMEOUT": "600", "BOXCODE_MAX_OUTPUT_TOKENS": "16384"})
+    assert (s.request_timeout_s, s.max_output_tokens) == (600, 16384)
 
 
 def test_context_settings_from_env() -> None:
@@ -47,6 +51,8 @@ def test_context_settings_from_env() -> None:
     ({"BOXCODE_PROVIDER": "gemini"}, "BOXCODE_PROVIDER"),
     ({"BOXCODE_EFFORT": "ultra"}, "BOXCODE_EFFORT"),
     ({"BOXCODE_THINKING": "off"}, "BOXCODE_THINKING"),
+    ({"BOXCODE_REQUEST_TIMEOUT": "0"}, "BOXCODE_REQUEST_TIMEOUT"),
+    ({"BOXCODE_MAX_OUTPUT_TOKENS": "-1"}, "BOXCODE_MAX_OUTPUT_TOKENS"),
     ({"BOXCODE_PROMPT_SKIP": "security,safety"}, "BOXCODE_PROMPT_SKIP"),  # 没有 safety 这一段
 ])
 def test_bad_values_name_the_variable(env: dict[str, str], var: str) -> None:

@@ -29,8 +29,6 @@ from boxcode.llm.base import (
     UserMessage,
 )
 
-REQUEST_TIMEOUT_S = 120
-
 
 def convert_tools(tools: Sequence[ToolSpec]) -> list[dict[str, Any]]:
     return [{"type": "function", "function": {"name": t.name, "description": t.description,
@@ -47,7 +45,10 @@ def convert_messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
                 out.append({"role": "user", "content": m.content})
             case AssistantMessage():
                 # native 是别的 Provider 的原始内容（例如 Claude 的思考块），不发出去
-                msg: dict[str, Any] = {"role": "assistant", "content": m.content}
+                # 没有正文也没有工具调用的回复（例如输出上限全被思考用完了）：按接口定义这时 content 必填，
+                # 发 null 过去 Ollama 返回 400，整次运行就断在这里
+                content = m.content if m.content is not None or m.tool_calls else ""
+                msg: dict[str, Any] = {"role": "assistant", "content": content}
                 if m.tool_calls:
                     msg["tool_calls"] = [
                         {"id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}
@@ -139,7 +140,9 @@ class OpenAICompatProvider:
         self._stream = settings.stream
         # thinking 不是 OpenAI 的标准参数，SDK 里只能放在 extra_body；default 时不带，不认识它的接口不受影响
         self._extra_body = {"thinking": {"type": "disabled"}} if settings.thinking == "disabled" else None
-        self._client = openai.OpenAI(base_url=settings.base_url, api_key=api_key, timeout=REQUEST_TIMEOUT_S)
+        # 0 表示不带 max_tokens。用 max_tokens 而不是新的 max_completion_tokens：各家兼容接口都认前一个
+        self._max_tokens = settings.max_output_tokens or openai.omit
+        self._client = openai.OpenAI(base_url=settings.base_url, api_key=api_key, timeout=settings.request_timeout_s)
 
     def complete(
         self, messages: Sequence[Message], tools: Sequence[ToolSpec], *, cancel: threading.Event | None = None,
@@ -163,6 +166,7 @@ class OpenAICompatProvider:
             model=self.name,
             messages=convert_messages(messages),
             tools=convert_tools(tools) or openai.omit,  # 空列表会被拒绝（Claude 的兼容接口返回 400）：没有工具就不带
+            max_tokens=self._max_tokens,
             extra_body=self._extra_body,
             stream=True,
             stream_options={"include_usage": True},  # 不带的话流式回复里没有 token 用量
@@ -176,6 +180,7 @@ class OpenAICompatProvider:
             model=self.name,
             messages=convert_messages(messages),  # type: ignore[arg-type]
             tools=convert_tools(tools) or openai.omit,  # type: ignore[arg-type]
+            max_tokens=self._max_tokens,
             extra_body=self._extra_body,
         )
         if not r.choices:
