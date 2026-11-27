@@ -66,6 +66,7 @@ class TraceRecorder:
             "completion_tokens": sum(e["completion_tokens"] for e in llm),
             "cached_tokens": sum(e.get("cached_tokens", 0) for e in llm),
             "llm_seconds": round(sum(e["latency_s"] for e in llm), 2),
+            "llm_retries": sum(e.get("retries", 0) for e in llm),
             "tool_calls": len(tools),
             "tool_errors": sum(1 for e in tools if not e["ok"]),
             "denied": sum(1 for e in tools if e["decision"] == "deny"),

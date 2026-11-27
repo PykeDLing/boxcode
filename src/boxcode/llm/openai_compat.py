@@ -7,7 +7,7 @@
 import json
 import threading
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import openai
@@ -16,6 +16,7 @@ from openai.types.chat import ChatCompletionChunk
 from boxcode.config import Settings
 from boxcode.llm.base import (
     AssistantMessage,
+    IncompleteReply,
     LLMCancelled,
     LLMResponse,
     LLMUnavailable,
@@ -28,6 +29,11 @@ from boxcode.llm.base import (
     Usage,
     UserMessage,
 )
+
+# 流没有收到 finish_reason 就结束时，同一个请求最多重发这么多次。本机模型实测（Ollama）：模型输出的工具调用
+# 格式不完整，Ollama 解析不了，不发结束标记就把流关了，状态码还是 200；144 次运行里遇到 4 次，重跑同一道题都没有再遇到。
+# 这时回复还没有交给主循环，什么都没执行，重发是安全的。和 Claude 那边工具参数解析不了时的做法一样（JSON_RETRIES）
+STREAM_RETRIES = 2
 
 
 def convert_tools(tools: Sequence[ToolSpec]) -> list[dict[str, Any]]:
@@ -121,8 +127,8 @@ def read_stream(chunks: Iterable[ChatCompletionChunk], cancel: threading.Event |
         raise LLMUnavailable("接口返回了空的 choices")
     if finish_reason is None:
         # 连接中途断了，或者接口没按约定收尾：工具参数可能只到了一半，不能当成完整的回复去执行
-        raise LLMUnavailable("回复没有收完（没有 finish_reason）：连接可能中途断了；"
-                             "接口的流式输出不完整的话，设置 BOXCODE_STREAM=false")
+        raise IncompleteReply("回复没有收完（没有 finish_reason）：连接可能中途断了；"
+                              "接口的流式输出不完整的话，设置 BOXCODE_STREAM=false")
     return LLMResponse(
         content="".join(text) or None,
         tool_calls=[ToolCall(id=c.id, name=c.name, arguments=c.arguments) for _, c in sorted(calls.items())],
@@ -161,18 +167,28 @@ class OpenAICompatProvider:
     def _complete_stream(
         self, messages: Sequence[Message], tools: Sequence[ToolSpec], cancel: threading.Event | None,
     ) -> LLMResponse:
-        # 消息和工具是普通的 dict，对不上 SDK 的 TypedDict：带了 stream=True 以后 mypy 报在整个调用上
-        stream: openai.Stream[ChatCompletionChunk] = self._client.chat.completions.create(  # type: ignore[call-overload]
-            model=self.name,
-            messages=convert_messages(messages),
-            tools=convert_tools(tools) or openai.omit,  # 空列表会被拒绝（Claude 的兼容接口返回 400）：没有工具就不带
-            max_tokens=self._max_tokens,
-            extra_body=self._extra_body,
-            stream=True,
-            stream_options={"include_usage": True},  # 不带的话流式回复里没有 token 用量
-        )
-        with stream:  # 取消或出错时关掉连接：服务器不再往下生成
-            return read_stream(stream, cancel)
+        attempt = 0
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise LLMCancelled
+            # 消息和工具是普通的 dict，对不上 SDK 的 TypedDict：带了 stream=True 以后 mypy 报在整个调用上
+            stream: openai.Stream[ChatCompletionChunk] = self._client.chat.completions.create(  # type: ignore[call-overload]
+                model=self.name,
+                messages=convert_messages(messages),
+                # 空的工具列表会被拒绝（Claude 的兼容接口返回 400）：没有工具就不带
+                tools=convert_tools(tools) or openai.omit,
+                max_tokens=self._max_tokens,
+                extra_body=self._extra_body,
+                stream=True,
+                stream_options={"include_usage": True},  # 不带的话流式回复里没有 token 用量
+            )
+            try:
+                with stream:  # 取消或出错时关掉连接：服务器不再往下生成
+                    return replace(read_stream(stream, cancel), retries=attempt)
+            except IncompleteReply:
+                if attempt == STREAM_RETRIES:
+                    raise
+                attempt += 1
 
     def _complete_whole(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> LLMResponse:
         # 不用流式，请求发出去就没法中途放弃：只在发之前看一眼。按停止时 Agent 不等它返回

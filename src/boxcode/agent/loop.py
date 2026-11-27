@@ -117,10 +117,10 @@ class Agent:
         self.approver = approver
         chosen = tools if tools is not None else default_tools(planning=settings.planning)
         self.tools: dict[str, Tool[Any]] = {t.name: t for t in chosen}
-        self.policy = Policy(self.execution.mode, self.workspace)
+        self.policy = Policy(self.execution.mode, self.workspace, self.execution.sandboxed)
         self.cancel = cancel or threading.Event()
-        self.ctx = ToolContext(self.workspace, runner or self.execution.make_runner(self.workspace), settings,
-                               self.cancel, self._record)
+        self.ctx = ToolContext(self.workspace, runner or self.execution.make_runner(self.workspace, settings.home),
+                               settings, self.cancel, self._record)
         self.trace = trace or TraceRecorder(settings.runs_dir)
         self.hooks = ToolHooks(hooks, self.trace)
         if prompt_sections is None:
@@ -274,7 +274,7 @@ class Agent:
         self.trace.emit("llm_call", turn=turn, latency_s=round(latency_s, 3),
                         prompt_tokens=resp.usage.prompt_tokens, completion_tokens=resp.usage.completion_tokens,
                         cached_tokens=resp.usage.cached_tokens, stop_reason=resp.stop_reason.value,
-                        tool_calls=[c.name for c in resp.tool_calls])
+                        retries=resp.retries, tool_calls=[c.name for c in resp.tool_calls])
 
     def _verify(self, command: str, turn: int) -> str | None:
         """跑自检命令。通过返回 None，没通过返回交回给模型的消息。"""

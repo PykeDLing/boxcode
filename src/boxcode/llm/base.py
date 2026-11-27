@@ -94,6 +94,8 @@ class LLMResponse:
     stop_reason: StopReason = StopReason.END
     native: Native | None = None
     server_compaction: ServerCompaction | None = None
+    # 拿到这条回复之前，同一个请求重发了几次（流没有收完、工具参数解析不了）。前几次的输出不在 usage 里
+    retries: int = 0
 
     @property
     def truncated(self) -> bool:
@@ -130,6 +132,10 @@ def clears_tool_results(llm: LLMProvider) -> bool:
 
 class LLMUnavailable(RuntimeError):
     """模型接口出错（超时、限流、鉴权失败）。"""
+
+
+class IncompleteReply(LLMUnavailable):
+    """回复没有收完流就结束了。这时还什么都没有执行，Provider 可以把同一个请求重发。"""
 
 
 class LLMCancelled(Exception):

@@ -18,7 +18,7 @@ from boxcode.tools.base import Risk, Target
 class ApprovalMode(StrEnum):
     READ_ONLY = "read-only"  # 只能读；写文件拒绝，执行命令要问，问过了也在只读沙盒里执行
     WORKSPACE_WRITE = "workspace-write"  # 默认：读写工作区、沙盒里执行；高风险命令要问
-    FULL_AUTO = "full-auto"  # 全部放行（仍在沙盒里），评测时用
+    FULL_AUTO = "full-auto"  # 全部放行，因为命令在沙盒里；没有沙盒时高风险命令照样先问
 
 
 @dataclass(frozen=True)
@@ -35,9 +35,12 @@ class ExecutionPolicy:
     def workspace_writable(self) -> bool:
         return self.mode is not ApprovalMode.READ_ONLY
 
-    def make_runner(self, workspace: Path) -> SandboxRunner:
+    def make_runner(self, workspace: Path, data_dir: Path | None = None) -> SandboxRunner:
+        """data_dir：BoxCode 的数据目录（执行轨迹、key 文件）。默认的 ~/.boxcode 本来就在沙盒的黑名单里，
+        用 BOXCODE_HOME 换了位置的不在（实测沙盒里读得到 key），所以按实际的位置再挡一次。"""
+        deny_read = self.deny_read if data_dir is None else (*self.deny_read, data_dir)
         return default_runner(workspace, allow_network=self.allow_network, writable=self.workspace_writable,
-                              no_sandbox=not self.sandboxed, deny_read=self.deny_read)
+                              no_sandbox=not self.sandboxed, deny_read=deny_read)
 
 
 # 不能当工作区的系统目录（含它们下面的目录）：沙盒放行整个工作区的写入，/Applications、/opt/homebrew
@@ -129,9 +132,10 @@ UNDECLARED_TARGET = "工具没有声明会写哪里、执行什么，无法判�
 
 
 class Policy:
-    def __init__(self, mode: ApprovalMode, workspace: Path) -> None:
+    def __init__(self, mode: ApprovalMode, workspace: Path, sandboxed: bool = True) -> None:
         self.mode = mode
         self.workspace = workspace.resolve()
+        self.sandboxed = sandboxed  # False 就是 --dangerously-no-sandbox：命令直接执行，后面没有东西兜底
 
     def check(self, risk: Risk, target: Target) -> Decision:
         if risk is Risk.READ:
@@ -152,11 +156,13 @@ class Policy:
         command = target.command
         if command is None:
             return Decision(Action.ASK, UNDECLARED_TARGET)
-        if self.mode is ApprovalMode.FULL_AUTO:
+        if self.mode is ApprovalMode.FULL_AUTO and self.sandboxed:
             return Decision(Action.ALLOW, "full-auto 模式，在沙盒中执行")
         if self.mode is ApprovalMode.READ_ONLY:
             return Decision(Action.ASK, "只读模式下执行命令需要确认")
+        # 到这里是 workspace-write，或者没有沙盒的 full-auto：full-auto 全部放行的理由是“在沙盒中执行”，
+        # 没有沙盒时这个理由不成立，下面的正则是剩下的唯一一道关，所以高风险命令照样先问
         for pattern, why in RISKY_COMMANDS:
             if pattern.search(command):
-                return Decision(Action.ASK, f"高风险命令（{why}）")
-        return Decision(Action.ALLOW, "在沙盒中执行")
+                return Decision(Action.ASK, f"高风险命令（{why}）" + ("" if self.sandboxed else "，没有沙盒"))
+        return Decision(Action.ALLOW, "在沙盒中执行" if self.sandboxed else "没有沙盒，直接执行")

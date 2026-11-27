@@ -18,6 +18,7 @@ SDK 解析不了的 JSON 会在流里抛 ValueError，这时拿不到 tool_use_i
 import json
 import threading
 from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from typing import Any, Protocol, cast
 
 import anthropic
@@ -228,4 +229,6 @@ class AnthropicProvider:
         cache_write = u.cache_creation_input_tokens or 0
         usage = Usage(prompt_tokens=u.input_tokens + cache_read + cache_write, completion_tokens=u.output_tokens,
                       cached_tokens=cache_read)
-        return parse_response([b.to_dict() for b in final.content], final.stop_reason, usage, server_compaction(final))
+        parsed = parse_response([b.to_dict() for b in final.content], final.stop_reason, usage,
+                                server_compaction(final))
+        return replace(parsed, retries=attempt)

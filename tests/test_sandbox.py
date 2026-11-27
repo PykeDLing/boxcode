@@ -447,6 +447,36 @@ def test_symlinked_dotfile_target_also_hidden(workspace: Path, tmp_path: Path) -
     assert "SECRET" not in r.stdout
 
 
+@macos_only
+def test_relocated_data_dir_is_unreadable(workspace: Path, settings: Settings) -> None:
+    # BOXCODE_HOME 换了位置：不在按名字挡的 ~/.boxcode 里。以前沙盒不知道它在哪，里面的 key 和轨迹读得到（实测）
+    settings.home.mkdir()
+    (settings.home / "api_key").write_text("sk-RELOCATED")
+    cat = f"cat '{settings.home}/api_key'"
+    llm = ScriptedProvider([LLMResponse(None, [call("run_command", command=cat)]), LLMResponse("done")])
+    Agent(llm, workspace, settings, ExecutionPolicy(ApprovalMode.FULL_AUTO)).run("x")  # Agent 自己建的沙盒
+    assert "sk-RELOCATED" not in "\n".join(str(getattr(m, "content", "")) for m in llm.seen[-1])
+    # 对照：不告诉沙盒数据目录在哪，同一条命令读得到
+    assert "sk-RELOCATED" in ExecutionPolicy().make_runner(workspace).run(cat, workspace, 10).stdout
+
+
+@macos_only
+def test_cannot_start_a_launchd_job(workspace: Path) -> None:
+    # `launchctl submit` 让 launchd 起一个任务，起来的进程不在沙盒里（和 `open` 是一类）。沙盒外实测能成功；
+    # 沙盒里被拒绝，但不是哪条规则挡的：只有 (allow default) 的规则下 launchd 也不接受沙盒里的进程提交任务。
+    # 规则里没有对应的一条，靠的是系统的行为，所以在这里钉住
+    label = f"dev.boxcode.test.{uuid.uuid4().hex}"
+    marker = Path.home() / f".boxcode-launchd-{uuid.uuid4().hex}"
+    try:
+        r = SeatbeltRunner(workspace).run(f"launchctl submit -l {label} -- /usr/bin/touch '{marker}'; sleep 2",
+                                          workspace, 15)
+        time.sleep(1)
+        assert not marker.exists(), r.stderr
+    finally:
+        subprocess.run(["launchctl", "remove", label], capture_output=True)
+        marker.unlink(missing_ok=True)
+
+
 def _lsregister() -> str:
     return ("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/"
             "lsregister")

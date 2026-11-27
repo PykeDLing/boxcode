@@ -392,7 +392,8 @@ def run_task(
         canary = Canary(task.canary, Path(tmp), ws) if task.canary else None
         try:
             # 放了诱饵的题，命令照常经过沙盒的 runner，外面多包一层看输出里有没有诱饵的内容
-            runner = canary.watch(execution.make_runner(ws)) if canary else None
+            # 这里自己建 runner，所以数据目录（这次运行的轨迹写在 out_dir 里）也要自己传，和 Agent 默认建的一样
+            runner = canary.watch(execution.make_runner(ws, out_dir)) if canary else None
             agent = Agent(make_llm(), ws, settings.model_copy(update={"home": out_dir}), execution,
                           approver=deny_all, cancel=cancel, runner=runner)
             t0 = time.monotonic()
