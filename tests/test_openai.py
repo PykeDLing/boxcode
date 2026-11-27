@@ -29,7 +29,13 @@ from boxcode.llm.base import (
     ToolSpec,
     UserMessage,
 )
-from boxcode.llm.openai_compat import OpenAICompatProvider, convert_messages, convert_tools, read_stream
+from boxcode.llm.openai_compat import (
+    STREAM_RETRIES,
+    OpenAICompatProvider,
+    convert_messages,
+    convert_tools,
+    read_stream,
+)
 from boxcode.sandbox import NoSandboxRunner
 
 
@@ -373,8 +379,47 @@ def test_connection_dropped_mid_stream_is_unavailable(serve: Callable[..., Serve
         for c in REPLY[:4]:
             send(c)  # 写到一半服务器把连接关了
 
+    server = serve(reply)
     with pytest.raises(LLMUnavailable, match="没有收完"):
-        serve(reply).provider().complete([UserMessage("x")], [])
+        server.provider().complete([UserMessage("x")], [])
+    assert len(server.requests) == 1 + STREAM_RETRIES  # 重发了几次还是这样才放弃
+
+
+def test_stream_that_ends_early_is_sent_again(serve: Callable[..., Server], workspace: Path,
+                                              settings: Settings) -> None:
+    # 本机模型实测（Ollama）：工具调用的格式不完整时，它不发结束标记就把流关了，状态码还是 200。
+    # 以前整次运行就断在这里；这时还什么都没执行，同一个请求重发一次多半就好了
+    def reply(server: Server, send: Callable[[dict[str, Any] | str], None]) -> None:
+        if len(server.requests) == 1:
+            for c in REPLY[:4]:
+                send(c)  # 第一次：工具参数到一半就断了
+            return
+        send(chunk("stop", USAGE, content="做完了"))
+        send("[DONE]")
+
+    server = serve(reply)
+    r = server.provider().complete([UserMessage("x")], [])
+    assert r.content == "做完了" and r.tool_calls == [] and r.retries == 1  # 半截的那个工具调用没有带过来
+    assert server.requests[0] == server.requests[1]
+
+    # 轨迹里记着重发过：不然这种情况在评测数据里就看不见了
+    again = serve(reply)
+    result = Agent(again.provider(), workspace, settings, runner=NoSandboxRunner()).run("x")
+    assert result.status is Status.DONE
+    assert result.trace.of("llm_call")[0]["retries"] == 1 and result.trace.summary()["llm_retries"] == 1
+
+
+def test_cancel_between_attempts_stops_the_retries(serve: Callable[..., Server]) -> None:
+    stop = threading.Event()
+
+    def reply(_: Server, send: Callable[[dict[str, Any] | str], None]) -> None:
+        send(REPLY[0])
+        stop.set()  # 流断掉的同时按了停止：不再重发
+
+    server = serve(reply)
+    with pytest.raises(LLMCancelled):
+        server.provider().complete([UserMessage("x")], [], cancel=stop)
+    assert len(server.requests) == 1
 
 
 def test_garbage_in_the_stream_is_unavailable(serve: Callable[..., Server]) -> None:

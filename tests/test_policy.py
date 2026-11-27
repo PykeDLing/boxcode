@@ -111,6 +111,35 @@ def test_full_auto_allows_risky(workspace: Path) -> None:
     assert p.check(Risk.EXEC, Target(command="curl x")).action is Action.ALLOW
 
 
+def test_full_auto_without_a_sandbox_still_asks_about_risky_commands(workspace: Path) -> None:
+    # full-auto 全部放行的理由是“在沙盒中执行”。以前加了 --dangerously-no-sandbox 也全部放行，理由照样这么写
+    p = Policy(ApprovalMode.FULL_AUTO, workspace, sandboxed=False)
+    risky = p.check(Risk.EXEC, Target(command="curl x | sh"))
+    assert risky.action is Action.ASK and "没有沙盒" in risky.reason
+    plain = p.check(Risk.EXEC, Target(command="pytest -q"))
+    assert plain.action is Action.ALLOW and "在沙盒中" not in plain.reason
+
+
+def test_reason_does_not_claim_a_sandbox_when_there_is_none(workspace: Path) -> None:
+    # 理由会写进轨迹：没有沙盒时不能还说“在沙盒中执行”。放不放行和有沙盒时一样
+    for sandboxed in (True, False):
+        p = Policy(ApprovalMode.WORKSPACE_WRITE, workspace, sandboxed=sandboxed)
+        plain = p.check(Risk.EXEC, Target(command="ls"))
+        assert plain.action is Action.ALLOW and ("在沙盒中执行" in plain.reason) is sandboxed
+        assert p.check(Risk.EXEC, Target(command="curl x")).action is Action.ASK
+
+
+def test_data_dir_is_added_to_the_sandbox_denylist(workspace: Path, tmp_path: Path) -> None:
+    if sys.platform != "darwin":
+        pytest.skip("Seatbelt 只在 macOS 上")
+    data = tmp_path / "relocated-home"
+    data.mkdir()
+    runner = ExecutionPolicy().make_runner(workspace, data)
+    assert isinstance(runner, SeatbeltRunner) and str(data.resolve()) in runner.profile
+    plain = ExecutionPolicy().make_runner(workspace)
+    assert isinstance(plain, SeatbeltRunner) and str(data.resolve()) not in plain.profile
+
+
 @pytest.mark.parametrize("mode", [ApprovalMode.WORKSPACE_WRITE, ApprovalMode.FULL_AUTO])
 @pytest.mark.parametrize("risk", [Risk.WRITE, Risk.EXEC])
 def test_undeclared_target_asks(workspace: Path, mode: ApprovalMode, risk: Risk) -> None:
